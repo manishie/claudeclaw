@@ -6,6 +6,12 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Resolve config directory — CLAUDECLAW_CONFIG from .env or environment, default ~/.claudeclaw
+if [ -z "$CLAUDECLAW_CONFIG" ]; then
+  CLAUDECLAW_CONFIG=$(grep '^CLAUDECLAW_CONFIG=' .env 2>/dev/null | cut -d'=' -f2- | sed "s|^~|$HOME|")
+fi
+CLAUDECLAW_CONFIG="${CLAUDECLAW_CONFIG:-$HOME/.claudeclaw}"
+
 echo "=== ClaudeClaw Agent Creator ==="
 echo ""
 
@@ -30,7 +36,15 @@ esac
 
 # Step 2: Name the agent
 read -p "Agent ID (lowercase, no spaces, e.g. 'comms'): " AGENT_ID
-AGENT_DIR="agents/$AGENT_ID"
+
+# Config goes to CLAUDECLAW_CONFIG if the dir exists, otherwise repo's agents/
+if [ -d "$CLAUDECLAW_CONFIG" ]; then
+  AGENT_DIR="$CLAUDECLAW_CONFIG/agents/$AGENT_ID"
+  echo "Config directory: $AGENT_DIR (external)"
+else
+  AGENT_DIR="agents/$AGENT_ID"
+  echo "Config directory: $AGENT_DIR (in repo)"
+fi
 
 if [ -d "$AGENT_DIR" ] && [ -f "$AGENT_DIR/agent.yaml" ]; then
   echo "Agent '$AGENT_ID' already exists at $AGENT_DIR"
@@ -44,7 +58,8 @@ fi
 # Step 3: Copy template
 mkdir -p "$AGENT_DIR"
 if [ "$TEMPLATE" != "$AGENT_ID" ]; then
-  cp "agents/$TEMPLATE/CLAUDE.md" "$AGENT_DIR/CLAUDE.md"
+  cp "agents/$TEMPLATE/CLAUDE.md" "$AGENT_DIR/CLAUDE.md" 2>/dev/null || \
+    cp "agents/$TEMPLATE/CLAUDE.md.example" "$AGENT_DIR/CLAUDE.md" 2>/dev/null || true
   cp "agents/$TEMPLATE/agent.yaml.example" "$AGENT_DIR/agent.yaml.example"
 fi
 

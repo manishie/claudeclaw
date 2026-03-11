@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import yaml from 'js-yaml';
 
-import { PROJECT_ROOT } from './config.js';
+import { CLAUDECLAW_CONFIG, PROJECT_ROOT } from './config.js';
 import { readEnvFile } from './env.js';
 
 export interface AgentConfig {
@@ -18,8 +18,36 @@ export interface AgentConfig {
   };
 }
 
+/**
+ * Resolve the directory for a given agent, checking CLAUDECLAW_CONFIG first,
+ * then falling back to PROJECT_ROOT/agents/<id>.
+ */
+export function resolveAgentDir(agentId: string): string {
+  const externalDir = path.join(CLAUDECLAW_CONFIG, 'agents', agentId);
+  if (fs.existsSync(path.join(externalDir, 'agent.yaml'))) {
+    return externalDir;
+  }
+  return path.join(PROJECT_ROOT, 'agents', agentId);
+}
+
+/**
+ * Resolve the CLAUDE.md path for a given agent, checking CLAUDECLAW_CONFIG first,
+ * then falling back to PROJECT_ROOT/agents/<id>/CLAUDE.md.
+ */
+export function resolveAgentClaudeMd(agentId: string): string | null {
+  const externalPath = path.join(CLAUDECLAW_CONFIG, 'agents', agentId, 'CLAUDE.md');
+  if (fs.existsSync(externalPath)) {
+    return externalPath;
+  }
+  const repoPath = path.join(PROJECT_ROOT, 'agents', agentId, 'CLAUDE.md');
+  if (fs.existsSync(repoPath)) {
+    return repoPath;
+  }
+  return null;
+}
+
 export function loadAgentConfig(agentId: string): AgentConfig {
-  const agentDir = path.join(PROJECT_ROOT, 'agents', agentId);
+  const agentDir = resolveAgentDir(agentId);
   const configPath = path.join(agentDir, 'agent.yaml');
 
   if (!fs.existsSync(configPath)) {
@@ -56,15 +84,25 @@ export function loadAgentConfig(agentId: string): AgentConfig {
   return { name, description, botTokenEnv, botToken, model, obsidian };
 }
 
-/** List all configured agent IDs (directories under agents/ with agent.yaml). */
+/** List all configured agent IDs (directories under agents/ with agent.yaml).
+ *  Scans both CLAUDECLAW_CONFIG/agents/ and PROJECT_ROOT/agents/, deduplicating.
+ */
 export function listAgentIds(): string[] {
-  const agentsDir = path.join(PROJECT_ROOT, 'agents');
-  if (!fs.existsSync(agentsDir)) return [];
-  return fs.readdirSync(agentsDir).filter((d) => {
-    if (d.startsWith('_')) return false;
-    const yamlPath = path.join(agentsDir, d, 'agent.yaml');
-    return fs.existsSync(yamlPath);
-  });
+  const ids = new Set<string>();
+
+  for (const baseDir of [
+    path.join(CLAUDECLAW_CONFIG, 'agents'),
+    path.join(PROJECT_ROOT, 'agents'),
+  ]) {
+    if (!fs.existsSync(baseDir)) continue;
+    for (const d of fs.readdirSync(baseDir)) {
+      if (d.startsWith('_')) continue;
+      const yamlPath = path.join(baseDir, d, 'agent.yaml');
+      if (fs.existsSync(yamlPath)) ids.add(d);
+    }
+  }
+
+  return [...ids];
 }
 
 /** Return the capabilities (name + description) for a specific agent. */

@@ -1,10 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 
-import { loadAgentConfig } from './agent-config.js';
+import { loadAgentConfig, resolveAgentDir, resolveAgentClaudeMd } from './agent-config.js';
 import { createBot } from './bot.js';
 import { checkPendingMigrations } from './migrations.js';
-import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, setAgentOverrides } from './config.js';
+import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, setAgentOverrides } from './config.js';
 import { startDashboard } from './dashboard.js';
 import { initDatabase } from './db.js';
 import { logger } from './logger.js';
@@ -23,12 +23,14 @@ process.env.CLAUDECLAW_AGENT_ID = AGENT_ID;
 
 if (AGENT_ID !== 'main') {
   const agentConfig = loadAgentConfig(AGENT_ID);
-  const agentDir = path.join(PROJECT_ROOT, 'agents', AGENT_ID);
-  const claudeMdPath = path.join(agentDir, 'CLAUDE.md');
+  const agentDir = resolveAgentDir(AGENT_ID);
+  const claudeMdPath = resolveAgentClaudeMd(AGENT_ID);
   let systemPrompt: string | undefined;
-  try {
-    systemPrompt = fs.readFileSync(claudeMdPath, 'utf-8');
-  } catch { /* no CLAUDE.md */ }
+  if (claudeMdPath) {
+    try {
+      systemPrompt = fs.readFileSync(claudeMdPath, 'utf-8');
+    } catch { /* no CLAUDE.md */ }
+  }
   setAgentOverrides({
     agentId: AGENT_ID,
     botToken: agentConfig.botToken,
@@ -38,6 +40,22 @@ if (AGENT_ID !== 'main') {
     systemPrompt,
   });
   logger.info({ agentId: AGENT_ID, name: agentConfig.name }, 'Running as agent');
+} else {
+  // For main bot: check if CLAUDE.md exists in CLAUDECLAW_CONFIG or repo
+  const externalClaudeMd = path.join(CLAUDECLAW_CONFIG, 'CLAUDE.md');
+  if (fs.existsSync(externalClaudeMd)) {
+    // Copy external CLAUDE.md into repo root so the SDK picks it up via cwd
+    fs.copyFileSync(externalClaudeMd, path.join(PROJECT_ROOT, 'CLAUDE.md'));
+    logger.info({ source: externalClaudeMd }, 'Loaded CLAUDE.md from CLAUDECLAW_CONFIG');
+  } else if (!fs.existsSync(path.join(PROJECT_ROOT, 'CLAUDE.md'))) {
+    const examplePath = path.join(PROJECT_ROOT, 'CLAUDE.md.example');
+    if (fs.existsSync(examplePath)) {
+      logger.warn(
+        'No CLAUDE.md found. Copy CLAUDE.md.example to CLAUDE.md (or to %s/CLAUDE.md) and customize it.',
+        CLAUDECLAW_CONFIG,
+      );
+    }
+  }
 }
 
 const PID_FILE = path.join(STORE_DIR, `${AGENT_ID === 'main' ? 'claudeclaw' : `agent-${AGENT_ID}`}.pid`);

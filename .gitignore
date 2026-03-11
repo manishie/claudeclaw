@@ -29,3 +29,8 @@ migrations/.applied.json
 
 # Personal scripts — not for sharing
 scripts/waste-reminder.sh
+
+# Personal config — lives in CLAUDECLAW_CONFIG (default ~/.claudeclaw)
+CLAUDE.md
+agents/*/agent.yaml
+agents/*/CLAUDE.md

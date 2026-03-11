@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { runAgent, UsageInfo } from './agent.js';
-import { loadAgentConfig, listAgentIds } from './agent-config.js';
+import { loadAgentConfig, listAgentIds, resolveAgentClaudeMd } from './agent-config.js';
 import { PROJECT_ROOT } from './config.js';
 import { logToHiveMind, createInterAgentTask, completeInterAgentTask } from './db.js';
 import { logger } from './logger.js';
@@ -156,13 +156,14 @@ export async function delegateToAgent(
 
   try {
     // Load agent config to get its system prompt
-    const agentDir = path.join(PROJECT_ROOT, 'agents', agentId);
-    const claudeMdPath = path.join(agentDir, 'CLAUDE.md');
+    const claudeMdPath = resolveAgentClaudeMd(agentId);
     let systemPrompt = '';
-    try {
-      systemPrompt = fs.readFileSync(claudeMdPath, 'utf-8');
-    } catch {
-      // No CLAUDE.md for this agent — that's fine
+    if (claudeMdPath) {
+      try {
+        systemPrompt = fs.readFileSync(claudeMdPath, 'utf-8');
+      } catch {
+        // No CLAUDE.md for this agent — that's fine
+      }
     }
 
     // Build the delegated prompt with agent role context

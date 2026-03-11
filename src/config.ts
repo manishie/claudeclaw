@@ -1,3 +1,4 @@
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -15,6 +16,7 @@ const envConfig = readEnvFile([
   'DASHBOARD_PORT',
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
+  'CLAUDECLAW_CONFIG',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -69,6 +71,28 @@ const __dirname = path.dirname(__filename);
 // and all global skills from ~/.claude/skills/ via settingSources.
 export const PROJECT_ROOT = path.resolve(__dirname, '..');
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
+
+// ── External config directory ────────────────────────────────────────
+// Personal config files (CLAUDE.md, agent.yaml, agent CLAUDE.md) can live
+// outside the repo in CLAUDECLAW_CONFIG (default ~/.claudeclaw) so they
+// never get committed. The repo ships only .example template files.
+
+/** Expand ~/... to an absolute path. */
+export function expandHome(p: string): string {
+  if (p.startsWith('~/') || p === '~') {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
+
+const rawConfigDir =
+  process.env.CLAUDECLAW_CONFIG || envConfig.CLAUDECLAW_CONFIG || '~/.claudeclaw';
+
+/**
+ * Absolute path to the external config directory.
+ * Defaults to ~/.claudeclaw. Set CLAUDECLAW_CONFIG in .env or environment to override.
+ */
+export const CLAUDECLAW_CONFIG = expandHome(rawConfigDir);
 
 // Telegram limits
 export const MAX_MESSAGE_LENGTH = 4096;
