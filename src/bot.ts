@@ -1222,8 +1222,31 @@ export function createBot(): Bot {
       const fileId = ctx.message.voice.file_id;
       const localPath = await downloadTelegramFile(activeBotToken, fileId, UPLOADS_DIR);
       const transcribed = await transcribeAudio(localPath);
-      // Voice in = voice out, always
       const chatIdStr = ctx.chat!.id.toString();
+
+      // Voice shortcut: "status" → scripted status (no Claude)
+      if (/^\s*(status|what's the status|check status)\s*[?.!]?\s*$/i.test(transcribed)) {
+        const task = backgroundTasks.get(chatIdStr);
+        let statusMsg: string;
+        if (!task) {
+          statusMsg = 'No background task running.';
+        } else {
+          const elapsed = Math.round((Date.now() - task.startedAt) / 1000);
+          const mins = Math.floor(elapsed / 60);
+          const secs = elapsed % 60;
+          const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+          statusMsg = `Running ${timeStr}: ${task.message.slice(0, 60)}`;
+        }
+        try {
+          const audioBuffer = await synthesizeSpeech(statusMsg);
+          await ctx.replyWithVoice(new InputFile(audioBuffer, 'status.ogg'));
+        } catch {
+          await ctx.reply(statusMsg);
+        }
+        return;
+      }
+
+      // Voice in = voice out, always
       messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `[Voice transcribed]: ${transcribed}`, true));
     } catch (err) {
       logger.error({ err }, 'Voice transcription failed');
