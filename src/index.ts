@@ -35,7 +35,7 @@ if (AGENT_ID !== 'main') {
   setAgentOverrides({
     agentId: AGENT_ID,
     botToken: agentConfig.botToken,
-    cwd: agentDir,
+    cwd: agentConfig.cwd || agentDir,
     model: agentConfig.model,
     obsidian: agentConfig.obsidian,
     systemPrompt,

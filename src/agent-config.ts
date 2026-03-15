@@ -11,6 +11,7 @@ export interface AgentConfig {
   botTokenEnv: string;
   botToken: string;
   model?: string;
+  cwd?: string;
   obsidian?: {
     vault: string;
     folders: string[];
@@ -60,6 +61,7 @@ export function loadAgentConfig(agentId: string): AgentConfig {
   const description = (raw['description'] as string) ?? '';
   const botTokenEnv = raw['telegram_bot_token_env'] as string;
   const model = raw['model'] as string | undefined;
+  const cwd = raw['cwd'] as string | undefined;
 
   if (!name || !botTokenEnv) {
     throw new Error(`Agent config ${configPath} must have 'name' and 'telegram_bot_token_env'`);
@@ -81,7 +83,7 @@ export function loadAgentConfig(agentId: string): AgentConfig {
     };
   }
 
-  return { name, description, botTokenEnv, botToken, model, obsidian };
+  return { name, description, botTokenEnv, botToken, model, cwd, obsidian };
 }
 
 /** List all configured agent IDs (directories under agents/ with agent.yaml).
