@@ -38,6 +38,7 @@ import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from '
 interface BackgroundTask {
   startedAt: number;
   message: string; // first 80 chars of the original request
+  lastActivity: string; // last tool/progress event
 }
 const backgroundTasks = new Map<string, BackgroundTask>(); // chatId -> active task
 
@@ -485,6 +486,11 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
     const onProgress = (event: AgentProgressEvent) => {
+      // Update background task's last activity
+      const bgTask = backgroundTasks.get(chatIdStr);
+      if (bgTask) {
+        bgTask.lastActivity = event.description;
+      }
       if (event.type === 'task_started') {
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
         void ctx.reply(`🔄 ${event.description}`).catch(() => {});
@@ -492,7 +498,6 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
         void ctx.reply(`✓ ${event.description}`).catch(() => {});
       } else if (event.type === 'tool_active') {
-        // Dashboard only — don't spam Telegram with every tool use
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
       }
     };
@@ -509,7 +514,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
     const ackTimeout = setTimeout(async () => {
       promoted = true;
-      backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80) });
+      backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), lastActivity: 'Starting...' });
       logger.info({ chatId: chatIdStr }, 'Promoting to background (>15s)');
       try {
         const caps = voiceCapabilities();
@@ -851,7 +856,7 @@ export function createBot(): Bot {
     const mins = Math.floor(elapsed / 60);
     const secs = elapsed % 60;
     const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-    await ctx.reply(`⏳ Running (${timeStr}): ${task.message}...`);
+    await ctx.reply(`⏳ ${timeStr} | ${task.lastActivity}`);
   });
 
   // /model — switch Claude model (opus, sonnet, haiku)
@@ -1235,7 +1240,7 @@ export function createBot(): Bot {
           const mins = Math.floor(elapsed / 60);
           const secs = elapsed % 60;
           const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-          statusMsg = `Running ${timeStr}: ${task.message.slice(0, 60)}`;
+          statusMsg = `${timeStr}. ${task.lastActivity}`;
         }
         try {
           const audioBuffer = await synthesizeSpeech(statusMsg);
