@@ -35,10 +35,15 @@ import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from '
 // MCP tools) can be 200-400k+ tokens. We track that baseline per session
 // so the warning reflects conversation growth, not fixed overhead.
 // ── Background task tracking ─────────────────────────────────────────
+interface BackgroundPhase {
+  name: string;
+  status: 'done' | 'active';
+}
 interface BackgroundTask {
   startedAt: number;
   message: string; // first 80 chars of the original request
-  lastActivity: string; // last tool/progress event
+  phases: BackgroundPhase[];
+  activity: string; // current tool (Web search, Reading file, etc.)
 }
 const backgroundTasks = new Map<string, BackgroundTask>(); // chatId -> active task
 
@@ -486,18 +491,26 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
     const onProgress = (event: AgentProgressEvent) => {
-      // Update background task's last activity
       const bgTask = backgroundTasks.get(chatIdStr);
-      if (bgTask) {
-        bgTask.lastActivity = event.description;
-      }
       if (event.type === 'task_started') {
+        // Mark any previously active phase as done, add new active phase
+        if (bgTask) {
+          for (const p of bgTask.phases) {
+            if (p.status === 'active') p.status = 'done';
+          }
+          bgTask.phases.push({ name: event.description, status: 'active' });
+          bgTask.activity = '';
+        }
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
-        void ctx.reply(`🔄 ${event.description}`).catch(() => {});
       } else if (event.type === 'task_completed') {
+        if (bgTask) {
+          const phase = bgTask.phases.find((p) => p.name === event.description);
+          if (phase) phase.status = 'done';
+          bgTask.activity = '';
+        }
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
-        void ctx.reply(`✓ ${event.description}`).catch(() => {});
       } else if (event.type === 'tool_active') {
+        if (bgTask) bgTask.activity = event.description;
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
       }
     };
@@ -514,7 +527,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
     const ackTimeout = setTimeout(async () => {
       promoted = true;
-      backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), lastActivity: 'Starting...' });
+      backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), phases: [], activity: 'Starting...' });
       logger.info({ chatId: chatIdStr }, 'Promoting to background (>15s)');
       try {
         const caps = voiceCapabilities();
@@ -856,7 +869,14 @@ export function createBot(): Bot {
     const mins = Math.floor(elapsed / 60);
     const secs = elapsed % 60;
     const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-    await ctx.reply(`⏳ ${timeStr} | ${task.lastActivity}`);
+    const lines = [`⏳ ${timeStr}`];
+    for (const p of task.phases) {
+      lines.push(p.status === 'done' ? `✅ ${p.name}` : `🔄 ${p.name}${task.activity ? ' — ' + task.activity : ''}`);
+    }
+    if (task.phases.length === 0) {
+      lines.push(`🔄 ${task.activity || 'Starting...'}`);
+    }
+    await ctx.reply(lines.join('\n'));
   });
 
   // /model — switch Claude model (opus, sonnet, haiku)
@@ -1240,7 +1260,13 @@ export function createBot(): Bot {
           const mins = Math.floor(elapsed / 60);
           const secs = elapsed % 60;
           const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-          statusMsg = `${timeStr}. ${task.lastActivity}`;
+          const done = task.phases.filter((p) => p.status === 'done').length;
+          const total = task.phases.length;
+          const active = task.phases.find((p) => p.status === 'active');
+          const activeDesc = active ? active.name : task.activity;
+          statusMsg = total > 0
+            ? `${timeStr}. ${done} of ${total} phases done. Now: ${activeDesc}${task.activity ? ', ' + task.activity : ''}.`
+            : `${timeStr}. ${task.activity || 'Starting.'}`;
         }
         try {
           const audioBuffer = await synthesizeSpeech(statusMsg);
