@@ -406,6 +406,23 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const abortCtrl = new AbortController();
     setActiveAbort(chatIdStr, abortCtrl);
 
+    // Auto-acknowledge: if Claude hasn't responded in 15s, send a quick
+    // "working on it" so the user knows the request was received.
+    // This is structural enforcement — can't be skipped by CLAUDE.md.
+    let ackSent = false;
+    const ackTimeout = setTimeout(async () => {
+      ackSent = true;
+      try {
+        const caps = voiceCapabilities();
+        if (forceVoiceReply && caps.tts) {
+          const ackAudio = await synthesizeSpeech('Got it, working on this.');
+          await ctx.replyWithVoice(new InputFile(ackAudio, 'ack.ogg'));
+        } else {
+          await ctx.reply('Got it, working on this...');
+        }
+      } catch { /* ignore ack errors */ }
+    }, 15_000);
+
     // Auto-abort if the agent runs too long (prevents runaway commands from blocking the bot)
     const timeoutId = setTimeout(() => {
       logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query timed out, aborting');
@@ -422,6 +439,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     );
 
     clearTimeout(timeoutId);
+    clearTimeout(ackTimeout);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
 
