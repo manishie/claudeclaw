@@ -477,7 +477,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   // Detect research intent and inject mandatory skill invocation
   const RESEARCH_PATTERN = /\b(research topic|deep research|research advisor|run.*advisor|full research|comprehensive research)\b/i;
   if (RESEARCH_PATTERN.test(message)) {
-    parts.push(`[MANDATORY: The user is requesting research. You MUST use the Skill tool to invoke /mkm-research-advisor. Do NOT perform research yourself — the skill handles all phases including web research, source verification, multi-model critique, and report generation. First create the topic directory if needed, then invoke the skill. This process takes 15-30 minutes. Do not shortcut any steps.]`);
+    parts.push(`[MANDATORY: The user is requesting research. You MUST use the Skill tool to invoke /mkm-research-driver. This is the non-interactive research skill designed for voice/remote workflows. Do NOT use /mkm-research-advisor (it requires interaction). Do NOT perform research yourself. First create the topic directory with /mkm-research-new if needed, then invoke /mkm-research-driver to execute the full research pipeline.]`);
   }
 
   parts.push(message);
