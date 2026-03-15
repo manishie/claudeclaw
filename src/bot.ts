@@ -490,29 +490,31 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
+    // Buffer progress events that arrive before background promotion
+    const earlyProgress: AgentProgressEvent[] = [];
+
     const onProgress = (event: AgentProgressEvent) => {
       const bgTask = backgroundTasks.get(chatIdStr);
-      if (event.type === 'task_started') {
-        // Mark any previously active phase as done, add new active phase
-        if (bgTask) {
-          for (const p of bgTask.phases) {
-            if (p.status === 'active') p.status = 'done';
-          }
-          bgTask.phases.push({ name: event.description, status: 'active' });
-          bgTask.activity = '';
-        }
+      if (!bgTask) {
+        // Not yet promoted — buffer for replay
+        earlyProgress.push(event);
         emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
-      } else if (event.type === 'task_completed') {
-        if (bgTask) {
-          const phase = bgTask.phases.find((p) => p.name === event.description);
-          if (phase) phase.status = 'done';
-          bgTask.activity = '';
-        }
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
-      } else if (event.type === 'tool_active') {
-        if (bgTask) bgTask.activity = event.description;
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+        return;
       }
+      if (event.type === 'task_started') {
+        for (const p of bgTask.phases) {
+          if (p.status === 'active') p.status = 'done';
+        }
+        bgTask.phases.push({ name: event.description, status: 'active' });
+        bgTask.activity = '';
+      } else if (event.type === 'task_completed') {
+        const phase = bgTask.phases.find((p) => p.name === event.description);
+        if (phase) phase.status = 'done';
+        bgTask.activity = '';
+      } else if (event.type === 'tool_active') {
+        bgTask.activity = event.description;
+      }
+      emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
     };
 
     const abortCtrl = new AbortController();
@@ -528,6 +530,21 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const ackTimeout = setTimeout(async () => {
       promoted = true;
       backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), phases: [], activity: 'Starting...' });
+      // Replay any progress events that arrived before promotion
+      const bgTask = backgroundTasks.get(chatIdStr)!;
+      for (const ev of earlyProgress) {
+        if (ev.type === 'task_started') {
+          for (const p of bgTask.phases) { if (p.status === 'active') p.status = 'done'; }
+          bgTask.phases.push({ name: ev.description, status: 'active' });
+          bgTask.activity = '';
+        } else if (ev.type === 'task_completed') {
+          const phase = bgTask.phases.find((p) => p.name === ev.description);
+          if (phase) phase.status = 'done';
+          bgTask.activity = '';
+        } else if (ev.type === 'tool_active') {
+          bgTask.activity = ev.description;
+        }
+      }
       logger.info({ chatId: chatIdStr }, 'Promoting to background (>15s)');
       try {
         const caps = voiceCapabilities();
