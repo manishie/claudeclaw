@@ -39,39 +39,41 @@ const lastUsage = new Map<string, UsageInfo>();
 const sessionBaseline = new Map<string, number>(); // sessionId -> first turn's input_tokens
 
 /**
- * Check if context usage is getting high and return a warning string, or null.
- * Uses input_tokens (total context) not cache_read_input_tokens (partial metric).
+ * Get context usage report. Always returns percentage so it can be shown
+ * after every response. Returns warning text at elevated levels.
  */
-function checkContextWarning(chatId: string, sessionId: string | undefined, usage: UsageInfo): string | null {
+function getContextReport(chatId: string, sessionId: string | undefined, usage: UsageInfo): { pct: number; status: string | null } {
   lastUsage.set(chatId, usage);
 
   if (usage.didCompact) {
-    return '⚠️ Context window was auto-compacted this turn. Some earlier conversation may have been summarized. Consider /newchat + /respin if things feel off.';
+    return { pct: 100, status: '⚠️ Context auto-compacted. Consider /newchat.' };
   }
 
   const contextTokens = usage.lastCallInputTokens;
-  if (contextTokens <= 0) return null;
+  if (contextTokens <= 0) return { pct: 0, status: null };
 
   // Record baseline on first turn of session (system prompt overhead)
   const baseKey = sessionId ?? chatId;
   if (!sessionBaseline.has(baseKey)) {
     sessionBaseline.set(baseKey, contextTokens);
-    // First turn — no warning, just establishing baseline
-    return null;
+    return { pct: 0, status: `[ctx: baseline ${Math.round(contextTokens / 1000)}k]` };
   }
 
   const baseline = sessionBaseline.get(baseKey)!;
   const available = CONTEXT_LIMIT - baseline;
-  if (available <= 0) return null;
+  if (available <= 0) return { pct: 100, status: '⚠️ Context limit reached.' };
 
   const conversationTokens = contextTokens - baseline;
   const pct = Math.round((conversationTokens / available) * 100);
+  const usedK = Math.round(conversationTokens / 1000);
+  const availK = Math.round(available / 1000);
 
-  if (pct >= Math.round(CONTEXT_WARN_PCT * 100)) {
-    return `⚠️ Context window at ~${pct}% of available space (~${Math.round(conversationTokens / 1000)}k / ${Math.round(available / 1000)}k conversation tokens). Consider /newchat + /respin soon.`;
+  if (pct >= 80) {
+    return { pct, status: `🛑 [ctx: ${pct}% — ${usedK}k/${availK}k] Auto-resetting...` };
+  } else if (pct >= 50) {
+    return { pct, status: `⚠️ [ctx: ${pct}% — ${usedK}k/${availK}k]` };
   }
-
-  return null;
+  return { pct, status: `[ctx: ${pct}% — ${usedK}k/${availK}k]` };
 }
 import {
   downloadTelegramFile,
@@ -535,9 +537,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
         logger.error({ err: dbErr }, 'Failed to save token usage');
       }
 
-      const warning = checkContextWarning(chatIdStr, activeSessionId, result.usage);
-      if (warning) {
-        await ctx.reply(warning);
+      const contextReport = getContextReport(chatIdStr, activeSessionId, result.usage);
+      if (contextReport.status) {
+        await ctx.reply(contextReport.status);
+      }
+      // Auto-reset session at 80% to prevent runaway context growth
+      if (contextReport.pct >= 80) {
+        clearSession(chatIdStr, AGENT_ID);
+        sessionBaseline.delete(activeSessionId ?? chatIdStr);
+        await ctx.reply('Session auto-reset (context at ' + contextReport.pct + '%). Memory preserved.');
       }
     }
 
