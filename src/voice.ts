@@ -385,17 +385,95 @@ export async function synthesizeSpeechLocal(text: string): Promise<Buffer> {
   }
 }
 
-// ── TTS: Cascade (ElevenLabs → Gradium → macOS say) ─────────────────────────
+// ── TTS: OpenAI (gpt-4o-mini-tts) ────────────────────────────────────────────
+
+/**
+ * Convert text to speech using OpenAI's TTS API (gpt-4o-mini-tts).
+ * Returns OGG Opus audio buffer directly ($0.003/min).
+ */
+async function synthesizeSpeechOpenAI(text: string): Promise<Buffer> {
+  const env = readEnvFile(['OPENAI_API_KEY']);
+  const apiKey = env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY not set');
+
+  const payload = JSON.stringify({
+    model: 'gpt-4o-mini-tts',
+    voice: 'alloy',
+    input: text,
+    response_format: 'opus',
+  });
+
+  return await httpsRequest(
+    'https://api.openai.com/v1/audio/speech',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload).toString(),
+      },
+    },
+    payload,
+  );
+}
+
+// ── TTS: Edge TTS (free, no API key) ─────────────────────────────────────────
+
+/**
+ * Convert text to speech using edge-tts CLI (Microsoft Edge voices, free).
+ * Requires: pip install edge-tts, ffmpeg installed.
+ */
+async function synthesizeSpeechEdgeTTS(text: string): Promise<Buffer> {
+  const id = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const tmpDir = path.join(UPLOADS_DIR, '..', 'tmp');
+  mkdirSync(tmpDir, { recursive: true });
+  const mp3Path = path.join(tmpDir, `tts_${id}.mp3`);
+  const oggPath = path.join(tmpDir, `tts_${id}.ogg`);
+
+  try {
+    await execFileAsync('edge-tts', ['--text', text, '--write-media', mp3Path]);
+    await execFileAsync('ffmpeg', [
+      '-i', mp3Path,
+      '-c:a', 'libopus',
+      '-b:a', '48k',
+      '-y',
+      oggPath,
+    ]);
+    try { fs.unlinkSync(mp3Path); } catch { /* ignore */ }
+    return fs.readFileSync(oggPath);
+  } finally {
+    try { fs.unlinkSync(oggPath); } catch { /* ignore */ }
+  }
+}
+
+// ── TTS: Cascade (OpenAI → Edge TTS → ElevenLabs → Gradium → macOS say) ─────
 
 /**
  * Convert text to speech using the first available provider.
- * Priority: ElevenLabs → Gradium AI → macOS say + ffmpeg.
+ * Priority: OpenAI gpt-4o-mini-tts → Edge TTS → ElevenLabs → Gradium AI → macOS say.
  */
 export async function synthesizeSpeech(text: string): Promise<Buffer> {
   const env = readEnvFile([
+    'OPENAI_API_KEY',
     'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
     'GRADIUM_API_KEY', 'GRADIUM_VOICE_ID',
   ]);
+
+  // Primary: OpenAI gpt-4o-mini-tts ($0.003/min)
+  if (env.OPENAI_API_KEY) {
+    try {
+      return await synthesizeSpeechOpenAI(text);
+    } catch (err) {
+      logger.warn({ err }, 'OpenAI TTS failed, trying edge-tts');
+    }
+  }
+
+  // Free fallback: Edge TTS (no API key needed)
+  try {
+    return await synthesizeSpeechEdgeTTS(text);
+  } catch (err) {
+    logger.warn({ err }, 'Edge TTS failed, trying next provider');
+  }
 
   const hasElevenLabs = !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID);
   const hasGradium = !!(env.GRADIUM_API_KEY && env.GRADIUM_VOICE_ID);
@@ -429,13 +507,15 @@ export function voiceCapabilities(): { stt: boolean; tts: boolean } {
   const env = readEnvFile([
     'GROQ_API_KEY',
     'WHISPER_MODEL_PATH',
+    'OPENAI_API_KEY',
     'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
     'GRADIUM_API_KEY', 'GRADIUM_VOICE_ID',
   ]);
 
   return {
     stt: !!env.GROQ_API_KEY || !!env.WHISPER_MODEL_PATH,
-    tts: !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID)
+    tts: !!env.OPENAI_API_KEY
+      || !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID)
       || !!(env.GRADIUM_API_KEY && env.GRADIUM_VOICE_ID)
       || process.platform === 'darwin',
   };
