@@ -34,6 +34,13 @@ import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from '
 // On a fresh session the base overhead (system prompt, skills, CLAUDE.md,
 // MCP tools) can be 200-400k+ tokens. We track that baseline per session
 // so the warning reflects conversation growth, not fixed overhead.
+// ── Background task tracking ─────────────────────────────────────────
+interface BackgroundTask {
+  startedAt: number;
+  message: string; // first 80 chars of the original request
+}
+const backgroundTasks = new Map<string, BackgroundTask>(); // chatId -> active task
+
 const CONTEXT_WARN_PCT = 0.75; // Warn when conversation fills 75% of available space
 const lastUsage = new Map<string, UsageInfo>();
 const sessionBaseline = new Map<string, number>(); // sessionId -> first turn's input_tokens
@@ -502,6 +509,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
     const ackTimeout = setTimeout(async () => {
       promoted = true;
+      backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80) });
       logger.info({ chatId: chatIdStr }, 'Promoting to background (>15s)');
       try {
         const caps = voiceCapabilities();
@@ -568,11 +576,13 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
         async (bgResult) => {
           await deliverResult(bgResult);
           await sendResult(ctx.api, chatId, chatIdStr, bgResult, message, sessionId, forceVoiceReply, skipLog);
+          backgroundTasks.delete(chatIdStr);
           setProcessing(chatIdStr, false);
           logger.info({ chatId: chatIdStr }, 'Background task completed');
         },
         (err) => {
           logger.error({ err }, 'Background agent error');
+          backgroundTasks.delete(chatIdStr);
           ctx.api.sendMessage(chatId, 'Background task failed.').catch(() => {});
           setProcessing(chatIdStr, false);
         },
@@ -828,6 +838,22 @@ export function createBot(): Bot {
     }
   });
 
+  // /status — scripted one-liner, no Claude involved
+  bot.command('status', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    const task = backgroundTasks.get(chatIdStr);
+    if (!task) {
+      await ctx.reply('No background task running.');
+      return;
+    }
+    const elapsed = Math.round((Date.now() - task.startedAt) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    await ctx.reply(`⏳ Running (${timeStr}): ${task.message}...`);
+  });
+
   // /model — switch Claude model (opus, sonnet, haiku)
   bot.command('model', async (ctx) => {
     if (!isAuthorised(ctx.chat!.id)) return;
@@ -1012,7 +1038,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
