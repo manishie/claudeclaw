@@ -290,6 +290,91 @@ function isAuthorised(chatId: number): boolean {
 }
 
 /**
+ * Send the result of an agent query to Telegram. Used by both the foreground
+ * fast path and the background promotion path.
+ */
+async function sendResult(
+  api: Api<RawApi>,
+  chatId: number,
+  chatIdStr: string,
+  result: Awaited<ReturnType<typeof runAgent>>,
+  message: string,
+  sessionId: string | undefined,
+  forceVoiceReply: boolean,
+  skipLog: boolean,
+): Promise<void> {
+  const rawResponse = result.text?.trim() || 'Done.';
+  const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
+
+  if (!skipLog) {
+    saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+  }
+
+  emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'telegram' });
+
+  // Send any attached files
+  for (const file of fileMarkers) {
+    try {
+      if (!fs.existsSync(file.filePath)) {
+        await api.sendMessage(chatId, `Could not send file: ${file.filePath} (not found)`);
+        continue;
+      }
+      const input = new InputFile(file.filePath);
+      if (file.type === 'photo') {
+        await api.sendPhoto(chatId, input, file.caption ? { caption: file.caption } : undefined);
+      } else {
+        await api.sendDocument(chatId, input, file.caption ? { caption: file.caption } : undefined);
+      }
+    } catch (fileErr) {
+      logger.error({ err: fileErr, filePath: file.filePath }, 'Failed to send file via Telegram');
+      await api.sendMessage(chatId, `Failed to send file: ${file.filePath}`);
+    }
+  }
+
+  // Voice or text response
+  const caps = voiceCapabilities();
+  const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
+
+  if (responseText) {
+    if (shouldSpeakBack) {
+      try {
+        const audioBuffer = await synthesizeSpeech(responseText);
+        await api.sendVoice(chatId, new InputFile(audioBuffer, 'response.ogg'));
+      } catch (ttsErr) {
+        logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
+        for (const part of splitMessage(formatForTelegram(responseText))) {
+          await api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+        }
+      }
+    } else {
+      for (const part of splitMessage(formatForTelegram(responseText))) {
+        await api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+      }
+    }
+  }
+
+  // Context tracking
+  if (result.usage) {
+    const activeSessionId = result.newSessionId ?? sessionId;
+    try {
+      saveTokenUsage(chatIdStr, activeSessionId, result.usage.inputTokens, result.usage.outputTokens, result.usage.lastCallCacheRead, result.usage.lastCallInputTokens, result.usage.totalCostUsd, result.usage.didCompact, AGENT_ID);
+    } catch (dbErr) {
+      logger.error({ err: dbErr }, 'Failed to save token usage');
+    }
+
+    const contextReport = getContextReport(chatIdStr, activeSessionId, result.usage);
+    if (contextReport.status) {
+      await api.sendMessage(chatId, contextReport.status);
+    }
+    if (contextReport.pct >= 80) {
+      clearSession(chatIdStr, AGENT_ID);
+      sessionBaseline.delete(activeSessionId ?? chatIdStr);
+      await api.sendMessage(chatId, 'Session auto-reset (context at ' + contextReport.pct + '%). Memory preserved.');
+    }
+  }
+}
+
+/**
  * Core message handler. Called for every inbound text/voice/photo/document.
  * @param forceVoiceReply  When true, always respond with audio (e.g. user sent a voice note).
  * @param skipLog  When true, skip logging this turn to conversation_log (used by /respin to avoid self-referential logging).
@@ -408,30 +493,60 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const abortCtrl = new AbortController();
     setActiveAbort(chatIdStr, abortCtrl);
 
-    // Auto-acknowledge: if Claude hasn't responded in 15s, send a quick
-    // "working on it" so the user knows the request was received.
-    // This is structural enforcement — can't be skipped by CLAUDE.md.
-    let ackSent = false;
+    // Background promotion: if Claude hasn't responded in 15s, send an ack,
+    // detach the query from the message queue, and let it finish in background.
+    // This frees the queue for new messages immediately.
+    let promoted = false;
+    let promoteResolve: (() => void) | null = null;
+    const promotePromise = new Promise<void>((resolve) => { promoteResolve = resolve; });
+
     const ackTimeout = setTimeout(async () => {
-      ackSent = true;
+      promoted = true;
+      logger.info({ chatId: chatIdStr }, 'Promoting to background (>15s)');
       try {
         const caps = voiceCapabilities();
         if (forceVoiceReply && caps.tts) {
-          const ackAudio = await synthesizeSpeech('Got it, working on this.');
+          const ackAudio = await synthesizeSpeech('Got it, working on this in the background. I\'ll message you when done.');
           await ctx.replyWithVoice(new InputFile(ackAudio, 'ack.ogg'));
         } else {
-          await ctx.reply('Got it, working on this...');
+          await ctx.reply('Got it, working on this in the background. I\'ll message you when done.');
         }
       } catch { /* ignore ack errors */ }
+      // Release the message queue handler so new messages can process
+      promoteResolve?.();
     }, 15_000);
 
-    // Auto-abort if the agent runs too long (prevents runaway commands from blocking the bot)
+    // Auto-abort if the agent runs too long
     const timeoutId = setTimeout(() => {
       logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query timed out, aborting');
       abortCtrl.abort();
     }, AGENT_TIMEOUT_MS);
 
-    const result = await runAgent(
+    // Deliver results when the query finishes (foreground or background)
+    const deliverResult = async (result: Awaited<ReturnType<typeof runAgent>>) => {
+      clearTimeout(timeoutId);
+      clearTimeout(ackTimeout);
+      setActiveAbort(chatIdStr, null);
+      clearInterval(typingInterval);
+
+      if (result.aborted) {
+        setProcessing(chatIdStr, false);
+        const msg = result.text === null
+          ? `Background task timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s.`
+          : 'Stopped.';
+        emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
+        await ctx.api.sendMessage(chatId, msg);
+        return;
+      }
+
+      if (result.newSessionId) {
+        setSession(chatIdStr, result.newSessionId, AGENT_ID);
+        logger.info({ newSessionId: result.newSessionId }, 'Session saved');
+      }
+    };
+
+    // Start the agent query
+    const agentPromise = runAgent(
       fullMessage,
       sessionId,
       () => void sendTyping(ctx.api, chatId),
@@ -440,115 +555,34 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       abortCtrl,
     );
 
-    clearTimeout(timeoutId);
-    clearTimeout(ackTimeout);
-    setActiveAbort(chatIdStr, null);
-    clearInterval(typingInterval);
+    // If promoted to background: release the queue now, deliver result later
+    // If not promoted: wait for result inline (normal fast path)
+    const result = await Promise.race([
+      agentPromise,
+      promotePromise.then(() => null as null),
+    ]);
 
-    // Handle abort (manual /stop or timeout)
-    if (result.aborted) {
-      setProcessing(chatIdStr, false);
-      const msg = result.text === null
-        ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. The task may have been too complex or a command got stuck. Try breaking it into smaller steps.`
-        : 'Stopped.';
-      emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
-      await ctx.reply(msg);
-      return;
+    if (result === null) {
+      // Promoted to background — release handler, deliver result when done
+      agentPromise.then(
+        async (bgResult) => {
+          await deliverResult(bgResult);
+          await sendResult(ctx.api, chatId, chatIdStr, bgResult, message, sessionId, forceVoiceReply, skipLog);
+          setProcessing(chatIdStr, false);
+          logger.info({ chatId: chatIdStr }, 'Background task completed');
+        },
+        (err) => {
+          logger.error({ err }, 'Background agent error');
+          ctx.api.sendMessage(chatId, 'Background task failed.').catch(() => {});
+          setProcessing(chatIdStr, false);
+        },
+      );
+      return; // Free the queue
     }
 
-    if (result.newSessionId) {
-      setSession(chatIdStr, result.newSessionId, AGENT_ID);
-      logger.info({ newSessionId: result.newSessionId }, 'Session saved');
-    }
-
-    const rawResponse = result.text?.trim() || 'Done.';
-
-    // Extract file markers before any formatting
-    const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
-
-    // Save conversation turn to memory (including full log).
-    // Skip logging for synthetic messages like /respin to avoid self-referential growth.
-    if (!skipLog) {
-      saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
-    }
-
-    // Emit assistant response to SSE clients
-    emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'telegram' });
-
-    // Send any attached files first
-    for (const file of fileMarkers) {
-      try {
-        if (!fs.existsSync(file.filePath)) {
-          await ctx.reply(`Could not send file: ${file.filePath} (not found)`);
-          continue;
-        }
-        const input = new InputFile(file.filePath);
-        if (file.type === 'photo') {
-          await ctx.replyWithPhoto(input, file.caption ? { caption: file.caption } : undefined);
-        } else {
-          await ctx.replyWithDocument(input, file.caption ? { caption: file.caption } : undefined);
-        }
-      } catch (fileErr) {
-        logger.error({ err: fileErr, filePath: file.filePath }, 'Failed to send file via Telegram');
-        await ctx.reply(`Failed to send file: ${file.filePath}`);
-      }
-    }
-
-    // Voice response: send audio if user sent a voice note (forceVoiceReply)
-    // OR if they've toggled /voice on for text messages.
-    const caps = voiceCapabilities();
-    const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
-
-    // Send text response (if there's any left after stripping markers)
-    if (responseText) {
-      if (shouldSpeakBack) {
-        try {
-          const audioBuffer = await synthesizeSpeech(responseText);
-          await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
-        } catch (ttsErr) {
-          logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
-          for (const part of splitMessage(formatForTelegram(responseText))) {
-            await ctx.reply(part, { parse_mode: 'HTML' });
-          }
-        }
-      } else {
-        for (const part of splitMessage(formatForTelegram(responseText))) {
-          await ctx.reply(part, { parse_mode: 'HTML' });
-        }
-      }
-    }
-
-    // Log token usage to SQLite and check for context warnings
-    if (result.usage) {
-      const activeSessionId = result.newSessionId ?? sessionId;
-      try {
-        saveTokenUsage(
-          chatIdStr,
-          activeSessionId,
-          result.usage.inputTokens,
-          result.usage.outputTokens,
-          result.usage.lastCallCacheRead,
-          result.usage.lastCallInputTokens,
-          result.usage.totalCostUsd,
-          result.usage.didCompact,
-          AGENT_ID,
-        );
-      } catch (dbErr) {
-        logger.error({ err: dbErr }, 'Failed to save token usage');
-      }
-
-      const contextReport = getContextReport(chatIdStr, activeSessionId, result.usage);
-      if (contextReport.status) {
-        await ctx.reply(contextReport.status);
-      }
-      // Auto-reset session at 80% to prevent runaway context growth
-      if (contextReport.pct >= 80) {
-        clearSession(chatIdStr, AGENT_ID);
-        sessionBaseline.delete(activeSessionId ?? chatIdStr);
-        await ctx.reply('Session auto-reset (context at ' + contextReport.pct + '%). Memory preserved.');
-      }
-    }
-
+    // Fast path — responded within 15s
+    await deliverResult(result);
+    await sendResult(ctx.api, chatId, chatIdStr, result, message, sessionId, forceVoiceReply, skipLog);
     setProcessing(chatIdStr, false);
   } catch (err) {
     clearInterval(typingInterval);
