@@ -62,7 +62,7 @@ function getContextReport(chatId: string, sessionId: string | undefined, usage: 
     return { pct: 100, status: '⚠️ Context auto-compacted. Consider /newchat.' };
   }
 
-  const contextTokens = usage.lastCallInputTokens;
+  const contextTokens = usage.lastCallInputTokens + usage.lastCallCacheRead;
   if (contextTokens <= 0) return { pct: 0, status: null };
 
   // Record baseline on first turn of session (system prompt overhead)
