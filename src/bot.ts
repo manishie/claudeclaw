@@ -929,23 +929,28 @@ export function createBot(): Bot {
     const mins = Math.floor(elapsed / 60);
     const secs = elapsed % 60;
     const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-    // Read file-based status from subagent
-    let fileStatus = '';
+
+    // Read wrapper status
+    let wrapperStatus = '';
+    try { wrapperStatus = fs.readFileSync('/tmp/research-status.txt', 'utf-8').trim(); } catch { /* */ }
+
+    // Read last line of trace log for real-time advisor progress
+    let traceStatus = '';
     try {
-      fileStatus = fs.readFileSync('/tmp/research-status.txt', 'utf-8').trim();
-    } catch { /* no status file yet */ }
-    const lines = [`⏳ ${timeStr}`];
-    // Show phases from progress events
-    for (const p of task.phases) {
-      lines.push(p.status === 'done' ? `✅ ${p.name}` : `🔄 ${p.name}${task.activity ? ' — ' + task.activity : ''}`);
-    }
-    // Show file-based status from subagent if available
-    if (fileStatus) {
-      lines.push(`📍 ${fileStatus}`);
-    } else if (task.phases.length === 0) {
-      lines.push(`🔄 ${task.activity || 'Starting...'}`);
-    }
-    await ctx.reply(lines.join('\n'));
+      const traceFiles = fs.readdirSync('/tmp').filter((f: string) => f.startsWith('ra-') && f.endsWith('-trace.log'));
+      if (traceFiles.length > 0) {
+        const latest = traceFiles.sort().pop()!;
+        const content = fs.readFileSync(`/tmp/${latest}`, 'utf-8').trim();
+        const lines = content.split('\n');
+        traceStatus = lines[lines.length - 1] || '';
+      }
+    } catch { /* */ }
+
+    const parts = [`⏳ ${timeStr}`];
+    if (wrapperStatus) parts.push(`📍 ${wrapperStatus}`);
+    if (traceStatus) parts.push(`🔎 ${traceStatus.slice(0, 120)}`);
+    if (!wrapperStatus && !traceStatus) parts.push(`🔄 ${task.activity || 'Starting...'}`);
+    await ctx.reply(parts.join('\n'));
   });
 
   // /model — switch Claude model (opus, sonnet, haiku)
@@ -1329,11 +1334,22 @@ export function createBot(): Bot {
           const mins = Math.floor(elapsed / 60);
           const secs = elapsed % 60;
           const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-          let fileStatus = '';
-          try { fileStatus = fs.readFileSync('/tmp/research-status.txt', 'utf-8').trim(); } catch { /* */ }
-          statusMsg = fileStatus
-            ? `${timeStr}. ${fileStatus}`
-            : `${timeStr}. ${task.activity || 'Starting.'}`;
+          let wrapperStatus = '';
+          let traceStatus = '';
+          try { wrapperStatus = fs.readFileSync('/tmp/research-status.txt', 'utf-8').trim(); } catch { /* */ }
+          try {
+            const traceFiles = fs.readdirSync('/tmp').filter((f: string) => f.startsWith('ra-') && f.endsWith('-trace.log'));
+            if (traceFiles.length > 0) {
+              const content = fs.readFileSync(`/tmp/${traceFiles.sort().pop()!}`, 'utf-8').trim();
+              const lines = content.split('\n');
+              traceStatus = lines[lines.length - 1] || '';
+            }
+          } catch { /* */ }
+          statusMsg = traceStatus
+            ? `${timeStr}. ${traceStatus.slice(0, 100)}`
+            : wrapperStatus
+              ? `${timeStr}. ${wrapperStatus}`
+              : `${timeStr}. ${task.activity || 'Starting.'}`;
         }
         try {
           const audioBuffer = await synthesizeSpeech(statusMsg);
