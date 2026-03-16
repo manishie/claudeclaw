@@ -589,12 +589,39 @@ Do NOT skip the subagent step. Do NOT do research yourself. The subagent is mand
       clearInterval(typingInterval);
 
       if (result.aborted) {
+        // Check if research completed before the timeout killed the process
+        let recovered = false;
+        try {
+          const resultJson = fs.readFileSync('/tmp/research-driver-result.json', 'utf-8');
+          const parsed = JSON.parse(resultJson) as { status?: string; topic?: string; report_path?: string; executive_summary?: string; timestamp?: string };
+          if (parsed.status === 'complete' && parsed.executive_summary) {
+            const summary = [
+              '✅ Research completed (recovered after timeout)',
+              '',
+              `**Report:** \`${parsed.report_path}\``,
+              '',
+              parsed.executive_summary,
+            ].join('\n');
+            emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: summary, source: 'telegram' });
+            for (const part of splitMessage(formatForTelegram(summary))) {
+              await ctx.api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+            }
+            // Clean up the result file
+            try { fs.unlinkSync('/tmp/research-driver-result.json'); } catch { /* */ }
+            recovered = true;
+          }
+        } catch { /* no result file or invalid JSON */ }
+
+        if (!recovered) {
+          setProcessing(chatIdStr, false);
+          const msg = result.text === null
+            ? `Background task timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. No results found.`
+            : 'Stopped.';
+          emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
+          await ctx.api.sendMessage(chatId, msg);
+        }
+        backgroundTasks.delete(chatIdStr);
         setProcessing(chatIdStr, false);
-        const msg = result.text === null
-          ? `Background task timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s.`
-          : 'Stopped.';
-        emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
-        await ctx.api.sendMessage(chatId, msg);
         return;
       }
 
