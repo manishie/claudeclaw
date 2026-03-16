@@ -606,10 +606,11 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
             for (const part of splitMessage(formatForTelegram(summary))) {
               await ctx.api.sendMessage(chatId, part, { parse_mode: 'HTML' });
             }
-            // Send report as file attachment if it exists
-            if (parsed.report_path && fs.existsSync(parsed.report_path)) {
+            // Send report as file attachment — prefer PDF, fall back to markdown
+            const filePath = (parsed as Record<string, unknown>).pdf_path as string | null || parsed.report_path;
+            if (filePath && fs.existsSync(filePath)) {
               try {
-                await ctx.api.sendDocument(chatId, new InputFile(parsed.report_path), {
+                await ctx.api.sendDocument(chatId, new InputFile(filePath), {
                   caption: `Research report: ${parsed.topic}`,
                 });
               } catch (fileErr) {
