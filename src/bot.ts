@@ -474,20 +474,20 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     parts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
   }
 
-  // Detect research intent and force subagent execution
+  // Detect research intent and run structural bash wrapper
   const RESEARCH_PATTERN = /\b(research topic|deep research|research advisor|run.*advisor|full research|comprehensive research)\b/i;
   if (RESEARCH_PATTERN.test(message)) {
-    parts.push(`[MANDATORY RESEARCH PROTOCOL: The user is requesting research. Follow these steps EXACTLY:
+    parts.push(`[MANDATORY RESEARCH PROTOCOL: The user is requesting research.
 
-1. Create the topic directory if it doesn't exist (use Bash: mkdir -p topics/<topic-name>/{inputs,docs,reports,archive})
-2. Create a brief.md in the topic directory with the research questions
-3. Use the Agent tool to spawn a subagent with run_in_background: false and this prompt:
-   "Before EACH step, write your current status to /tmp/research-status.txt using Bash, e.g.: echo 'Step 1: Web research — searching for token optimization' > /tmp/research-status.txt
-   Use the Skill tool to invoke /mkm-research-driver for topic <topic-name>. Run the full research pipeline — all phases, web research, multi-model critique, report generation. Write the report to topics/<topic-name>/reports/. Do not shortcut any steps."
-4. The subagent gets a fresh context window so the skill fits. Do NOT invoke the skill yourself — your context is too small.
-5. When the subagent returns, summarize the key findings for the user.
+1. Determine the topic name from the user's message (kebab-case, 2-3 words).
+2. Determine the directive (what specific research questions to answer), or leave empty for general research.
+3. Run this EXACT command via Bash — do NOT invoke skills yourself:
+   bash /home/node/projects/hub/scripts/research-wrapper.sh "<topic-name>" "<directive>"
+4. The script handles everything: scaffolding, advisor invocation, status tracking, commit, and push.
+5. After the script completes, read /tmp/research-driver-result.json and summarize the key findings for the user.
+6. If the script fails, read /tmp/research-driver-result.json for the error details.
 
-Do NOT skip the subagent step. Do NOT do research yourself. The subagent is mandatory.]`);
+Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-research-driver directly. The wrapper script is mandatory.]`);
   }
 
   parts.push(message);
