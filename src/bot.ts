@@ -476,7 +476,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
   // Detect research intent and run structural bash wrapper
   const RESEARCH_PATTERN = /\b(research topic|deep research|research advisor|run.*advisor|full research|comprehensive research)\b/i;
-  if (RESEARCH_PATTERN.test(message)) {
+  const isResearchRequest = RESEARCH_PATTERN.test(message);
+  if (isResearchRequest) {
     parts.push(`[MANDATORY RESEARCH PROTOCOL: The user is requesting research.
 
 1. Determine the topic name from the user's message (kebab-case, 2-3 words).
@@ -536,14 +537,13 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
     const abortCtrl = new AbortController();
     setActiveAbort(chatIdStr, abortCtrl);
 
-    // Background promotion: if Claude hasn't responded in 15s, send an ack,
-    // detach the query from the message queue, and let it finish in background.
-    // This frees the queue for new messages immediately.
+    // Background promotion: only for research/long-running tasks.
+    // Normal messages wait for Claude to respond without an ack.
     let promoted = false;
     let promoteResolve: (() => void) | null = null;
     const promotePromise = new Promise<void>((resolve) => { promoteResolve = resolve; });
 
-    const ackTimeout = setTimeout(async () => {
+    const ackTimeout = !isResearchRequest ? null : setTimeout(async () => {
       promoted = true;
       backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), phases: [], activity: 'Starting...' });
       // Replay any progress events that arrived before promotion
@@ -584,7 +584,7 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
     // Deliver results when the query finishes (foreground or background)
     const deliverResult = async (result: Awaited<ReturnType<typeof runAgent>>) => {
       clearTimeout(timeoutId);
-      clearTimeout(ackTimeout);
+      if (ackTimeout) clearTimeout(ackTimeout);
       setActiveAbort(chatIdStr, null);
       clearInterval(typingInterval);
 
@@ -654,10 +654,10 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
 
     // If promoted to background: release the queue now, deliver result later
     // If not promoted: wait for result inline (normal fast path)
-    const result = await Promise.race([
-      agentPromise,
-      promotePromise.then(() => null as null),
-    ]);
+    // Only race with promotion promise for research requests
+    const result = isResearchRequest
+      ? await Promise.race([agentPromise, promotePromise.then(() => null as null)])
+      : await agentPromise;
 
     if (result === null) {
       // Promoted to background — release handler, deliver result when done
