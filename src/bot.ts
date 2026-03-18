@@ -7,7 +7,7 @@ import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
 import {
   AGENT_ID,
   ALLOWED_CHAT_ID,
-  CONTEXT_LIMIT,
+  contextLimitForModel,
   DASHBOARD_PORT,
   DASHBOARD_TOKEN,
   DASHBOARD_URL,
@@ -19,6 +19,8 @@ import {
   AGENT_TIMEOUT_MS,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
+import { extractSessionHandoff } from './memory-ingest.js';
+import { performPlatformSwitch } from './sync.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, saveConversationTurn } from './memory.js';
@@ -47,46 +49,40 @@ interface BackgroundTask {
 }
 const backgroundTasks = new Map<string, BackgroundTask>(); // chatId -> active task
 
-const CONTEXT_WARN_PCT = 0.75; // Warn when conversation fills 75% of available space
 const lastUsage = new Map<string, UsageInfo>();
-const sessionBaseline = new Map<string, number>(); // sessionId -> first turn's input_tokens
 
 /**
- * Get context usage report. Always returns percentage so it can be shown
- * after every response. Returns warning text at elevated levels.
+ * Get context usage report. Shows total context window usage as a percentage
+ * of the model's context limit, calculated directly from token counts.
+ *
+ * Simple formula: pct = (lastCallInputTokens + lastCallCacheRead) / contextLimit
+ *
+ * The limit is derived from the active model name (1M for Opus/Sonnet 4.6, 200K otherwise).
+ *
+ * When didCompact is true, we set justCompacted so the caller can avoid
+ * auto-resetting (compaction already saved the session).
  */
-function getContextReport(chatId: string, sessionId: string | undefined, usage: UsageInfo): { pct: number; status: string | null } {
+function getContextReport(chatId: string, sessionId: string | undefined, usage: UsageInfo): { pct: number; status: string | null; justCompacted?: boolean } {
   lastUsage.set(chatId, usage);
 
-  if (usage.didCompact) {
-    return { pct: 100, status: '⚠️ Context auto-compacted. Consider /newchat.' };
-  }
-
+  const activeModel = chatModelOverride.get(chatId) ?? agentDefaultModel;
+  const limit = contextLimitForModel(activeModel);
   const contextTokens = usage.lastCallInputTokens + usage.lastCallCacheRead;
-  if (contextTokens <= 0) return { pct: 0, status: null };
+  const totalK = Math.round(contextTokens / 1000);
+  const limitK = Math.round(limit / 1000);
+  const pct = contextTokens > 0 ? Math.round((contextTokens / limit) * 100) : 0;
 
-  // Record baseline on first turn of session (system prompt overhead)
-  const baseKey = sessionId ?? chatId;
-  if (!sessionBaseline.has(baseKey)) {
-    sessionBaseline.set(baseKey, contextTokens);
-    return { pct: 0, status: `[ctx: baseline ${Math.round(contextTokens / 1000)}k]` };
+  if (usage.didCompact) {
+    const preK = usage.preCompactTokens ? Math.round(usage.preCompactTokens / 1000) : null;
+    return { pct, status: `⚠️ [ctx: compacted${preK ? ` from ${preK}k` : ''}, now ${pct}% — ${totalK}k/${limitK}k] Earlier context summarized, memory preserved.`, justCompacted: true };
   }
 
-  const baseline = sessionBaseline.get(baseKey)!;
-  const available = CONTEXT_LIMIT - baseline;
-  if (available <= 0) return { pct: 100, status: '⚠️ Context limit reached.' };
-
-  const conversationTokens = contextTokens - baseline;
-  const pct = Math.round((conversationTokens / available) * 100);
-  const usedK = Math.round(conversationTokens / 1000);
-  const availK = Math.round(available / 1000);
-
-  if (pct >= 80) {
-    return { pct, status: `🛑 [ctx: ${pct}% — ${usedK}k/${availK}k] Auto-resetting...` };
+  if (pct >= 70) {
+    return { pct, status: `🛑 [ctx: ${pct}% — ${totalK}k/${limitK}k] Handoff + auto-reset...` };
   } else if (pct >= 50) {
-    return { pct, status: `⚠️ [ctx: ${pct}% — ${usedK}k/${availK}k]` };
+    return { pct, status: `⚠️ [ctx: ${pct}% — ${totalK}k/${limitK}k]` };
   }
-  return { pct, status: `[ctx: ${pct}% — ${usedK}k/${availK}k]` };
+  return { pct, status: `[ctx: ${pct}% — ${totalK}k/${limitK}k]` };
 }
 import {
   downloadTelegramFile,
@@ -345,23 +341,36 @@ async function sendResult(
   }
 
   // Voice or text response
+  // Split on '---' delimiter for semantic multi-message delivery.
+  // Claude is instructed to use '---' between logical response sections
+  // so each topic arrives as its own separate Telegram message.
   const caps = voiceCapabilities();
   const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
   if (responseText) {
+    // Split into semantic sections on markdown horizontal rule (---)
+    const sections = responseText
+      .split(/\n---\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
     if (shouldSpeakBack) {
-      try {
-        const audioBuffer = await synthesizeSpeech(responseText);
-        await api.sendVoice(chatId, new InputFile(audioBuffer, 'response.ogg'));
-      } catch (ttsErr) {
-        logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
-        for (const part of splitMessage(formatForTelegram(responseText))) {
-          await api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+      for (const section of sections) {
+        try {
+          const audioBuffer = await synthesizeSpeech(section);
+          await api.sendVoice(chatId, new InputFile(audioBuffer, 'response.ogg'));
+        } catch (ttsErr) {
+          logger.error({ err: ttsErr }, 'TTS failed for section, falling back to text');
+          for (const part of splitMessage(formatForTelegram(section))) {
+            await api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+          }
         }
       }
     } else {
-      for (const part of splitMessage(formatForTelegram(responseText))) {
-        await api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+      for (const section of sections) {
+        for (const part of splitMessage(formatForTelegram(section))) {
+          await api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+        }
       }
     }
   }
@@ -379,9 +388,19 @@ async function sendResult(
     if (contextReport.status) {
       await api.sendMessage(chatId, contextReport.status);
     }
-    if (contextReport.pct >= 80) {
+    if (contextReport.pct >= 70 && !contextReport.justCompacted) {
+      // Extract structured handoff via Gemini before clearing
+      const activeSessionId = result.newSessionId ?? sessionId;
+      try {
+        const handoffSaved = await extractSessionHandoff(chatIdStr, activeSessionId, AGENT_ID);
+        if (handoffSaved) {
+          logger.info({ chatId: chatIdStr }, 'Handoff extracted before auto-reset');
+        }
+      } catch (handoffErr) {
+        logger.error({ err: handoffErr }, 'Handoff extraction failed (non-blocking)');
+      }
+
       clearSession(chatIdStr, AGENT_ID);
-      sessionBaseline.delete(activeSessionId ?? chatIdStr);
       await api.sendMessage(chatId, 'Session auto-reset (context at ' + contextReport.pct + '%). Memory preserved.');
     }
   }
@@ -457,6 +476,12 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     return;
   }
 
+  // Wrap everything in try/catch so failures in context building, session
+  // lookup, or typing setup don't silently swallow the message. Without this,
+  // the user gets 👍 but zero response when pre-agent code throws.
+  let typingInterval: ReturnType<typeof setInterval> | undefined;
+  try {
+
   // Build memory context and prepend to message
   const memCtx = await buildMemoryContext(chatIdStr, message);
   const parts: string[] = [];
@@ -498,7 +523,7 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
-  const typingInterval = setInterval(
+  typingInterval = setInterval(
     () => void sendTyping(ctx.api, chatId),
     TYPING_REFRESH_MS,
   );
@@ -707,6 +732,17 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
       await ctx.reply('Something went wrong. Check the logs and try again.');
     }
   }
+
+  // Outer catch: covers pre-agent code (memory context building, session lookup,
+  // typing setup). Without this, errors in that code silently swallow the message.
+  } catch (outerErr) {
+    if (typingInterval) clearInterval(typingInterval);
+    setProcessing(chatIdStr, false);
+    logger.error({ err: outerErr }, 'Message handling error (pre-agent)');
+    try {
+      await ctx.reply('Something went wrong setting up the message. Try sending again.');
+    } catch { /* last resort — can't even reply */ }
+  }
 }
 
 /**
@@ -799,6 +835,7 @@ export function createBot(): Bot {
       'ClaudeClaw — Commands\n\n' +
       '/newchat — Start a new Claude session\n' +
       '/respin — Reload recent context\n' +
+      '/switch — Sync memories & switch platform (desktop/telegram)\n' +
       '/voice — Toggle voice mode on/off\n' +
       '/model — Switch model (opus/sonnet/haiku)\n' +
       '/memory — View recent memories\n' +
@@ -840,7 +877,6 @@ export function createBot(): Bot {
     // Auto-commit session summary to hive mind (async, don't block the user)
     if (oldSessionId) {
       const sessionToSummarize = oldSessionId;
-      sessionBaseline.delete(oldSessionId);
 
       // Fire-and-forget: ask the agent to produce a one-liner summary
       (async () => {
@@ -877,7 +913,6 @@ export function createBot(): Bot {
     }
 
     clearSession(chatIdStr, AGENT_ID);
-    sessionBaseline.delete(chatIdStr);
     await ctx.reply('Session cleared. Starting fresh.');
     logger.info({ chatId: ctx.chat!.id }, 'Session cleared by user');
   });
@@ -1020,6 +1055,31 @@ export function createBot(): Bot {
     await ctx.reply('Session cleared. Memories will fade naturally over time.');
   });
 
+  // /switch — cross-platform handoff (switch between desktop and telegram)
+  bot.command('switch', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    const sessionId = getSession(chatIdStr, AGENT_ID);
+
+    await ctx.reply('🔄 Syncing memories for platform switch...');
+
+    const result = await performPlatformSwitch(chatIdStr, AGENT_ID, () =>
+      extractSessionHandoff(chatIdStr, sessionId, AGENT_ID),
+    );
+
+    const parts: string[] = [];
+    if (result.handoffSaved) parts.push('✅ Handoff saved');
+    if (result.factsExported > 0) parts.push(`✅ ${result.factsExported} facts exported`);
+    if (result.pushed) parts.push('✅ Pushed to git');
+    else parts.push('⚠️ Git push failed — pull manually');
+
+    clearSession(chatIdStr, AGENT_ID);
+    parts.push('✅ Session cleared');
+
+    await ctx.reply(parts.join('\n') + '\n\nSwitch to the other platform and start chatting — full context will be injected.');
+    logger.info({ chatId: chatIdStr, result }, 'Platform switch completed');
+  });
+
   // /wa — pull recent WhatsApp chats on demand
   bot.command('wa', async (ctx) => {
     const chatIdStr = ctx.chat!.id.toString();
@@ -1148,7 +1208,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/switch', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -1305,6 +1365,32 @@ export function createBot(): Bot {
       }
     }
 
+    // ── Platform switch detection ────────────────────────────────────
+    // Detect "switching to desktop", "switch to telegram", "going to desktop", etc.
+    const switchMatch = text.match(/\b(?:switch(?:ing)?|going|moving)\s+to\s+(desktop|telegram|mobile|phone|computer|laptop)\b/i);
+    if (switchMatch) {
+      const target = switchMatch[1].toLowerCase();
+      const sessionId = getSession(chatIdStr, AGENT_ID);
+      await ctx.reply('🔄 Syncing memories for platform switch...');
+
+      const result = await performPlatformSwitch(chatIdStr, AGENT_ID, () =>
+        extractSessionHandoff(chatIdStr, sessionId, AGENT_ID),
+      );
+
+      const parts: string[] = [];
+      if (result.handoffSaved) parts.push('✅ Handoff saved');
+      if (result.factsExported > 0) parts.push(`✅ ${result.factsExported} facts exported`);
+      if (result.pushed) parts.push('✅ Pushed to git');
+      else parts.push('⚠️ Git push failed — pull manually');
+
+      clearSession(chatIdStr, AGENT_ID);
+      parts.push('✅ Session cleared');
+
+      await ctx.reply(parts.join('\n') + `\n\nReady — switch to ${target} and start chatting.`);
+      logger.info({ chatId: chatIdStr, target, result }, 'Platform switch completed via voice');
+      return;
+    }
+
     // Clear WA/Slack state and pass through to Claude
     if (state) waState.delete(chatIdStr);
     if (slkState) slackState.delete(chatIdStr);
@@ -1333,6 +1419,13 @@ export function createBot(): Bot {
       const localPath = await downloadTelegramFile(activeBotToken, fileId, UPLOADS_DIR);
       const transcribed = await transcribeAudio(localPath);
       const chatIdStr = ctx.chat!.id.toString();
+
+      // Instant acknowledgment: thumbs up so the user knows we got it
+      try {
+        await ctx.reply('👍🏾');
+      } catch (ackErr) {
+        logger.warn({ err: ackErr }, 'Voice ack failed (non-fatal)');
+      }
 
       // Voice shortcut: "status" → scripted status (no Claude)
       if (/^\s*(status|what's the status|check status)\s*[?.!]?\s*$/i.test(transcribed)) {

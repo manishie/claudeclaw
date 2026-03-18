@@ -216,6 +216,26 @@ function createSchema(database: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_inter_agent_tasks_status ON inter_agent_tasks(status, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS session_handoffs (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id     TEXT NOT NULL,
+      session_id  TEXT,
+      summary     TEXT NOT NULL,
+      current_topic TEXT,
+      accomplished TEXT NOT NULL DEFAULT '[]',
+      work_in_progress TEXT NOT NULL DEFAULT '[]',
+      decisions   TEXT NOT NULL DEFAULT '[]',
+      next_steps  TEXT NOT NULL DEFAULT '[]',
+      open_questions TEXT NOT NULL DEFAULT '[]',
+      blockers    TEXT NOT NULL DEFAULT '[]',
+      key_facts   TEXT NOT NULL DEFAULT '[]',
+      important_context TEXT,
+      created_at  INTEGER NOT NULL,
+      agent_id    TEXT NOT NULL DEFAULT 'main'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_handoffs_chat ON session_handoffs(chat_id, created_at DESC);
+
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
       summary,
       raw_text,
@@ -412,6 +432,18 @@ function runMigrations(database: Database.Database): void {
   if (memColsPost.some((c) => c.name === 'importance') && !memColsPost.some((c) => c.name === 'embedding')) {
     database.exec(`ALTER TABLE memories ADD COLUMN embedding TEXT`);
     logger.info('Migration: added embedding column to memories table');
+  }
+
+  // Enrich session_handoffs with additional structured fields
+  const handoffCols = database.prepare(`PRAGMA table_info(session_handoffs)`).all() as Array<{ name: string }>;
+  const handoffColNames = handoffCols.map((c) => c.name);
+  if (handoffColNames.length > 0 && !handoffColNames.includes('accomplished')) {
+    database.exec(`ALTER TABLE session_handoffs ADD COLUMN accomplished TEXT NOT NULL DEFAULT '[]'`);
+    database.exec(`ALTER TABLE session_handoffs ADD COLUMN work_in_progress TEXT NOT NULL DEFAULT '[]'`);
+    database.exec(`ALTER TABLE session_handoffs ADD COLUMN open_questions TEXT NOT NULL DEFAULT '[]'`);
+    database.exec(`ALTER TABLE session_handoffs ADD COLUMN blockers TEXT NOT NULL DEFAULT '[]'`);
+    database.exec(`ALTER TABLE session_handoffs ADD COLUMN key_facts TEXT NOT NULL DEFAULT '[]'`);
+    logger.info('Migration: enriched session_handoffs with accomplished, work_in_progress, open_questions, blockers, key_facts');
   }
 }
 
@@ -1437,6 +1469,84 @@ export function getSessionTokenUsage(sessionId: string): SessionTokenSummary | n
     firstTurnAt: row.firstTurnAt,
     lastTurnAt: row.lastTurnAt,
   };
+}
+
+// ── Session Handoffs ──────────────────────────────────────────────────
+
+export interface SessionHandoff {
+  id: number;
+  chat_id: string;
+  session_id: string | null;
+  summary: string;
+  current_topic: string | null;
+  accomplished: string;      // JSON array
+  work_in_progress: string;  // JSON array
+  decisions: string;         // JSON array
+  next_steps: string;        // JSON array
+  open_questions: string;    // JSON array
+  blockers: string;          // JSON array
+  key_facts: string;         // JSON array
+  important_context: string | null;
+  created_at: number;
+  agent_id: string;
+}
+
+export function saveSessionHandoff(
+  chatId: string,
+  sessionId: string | undefined,
+  summary: string,
+  currentTopic: string | null,
+  accomplished: string[],
+  workInProgress: string[],
+  decisions: string[],
+  nextSteps: string[],
+  openQuestions: string[],
+  blockers: string[],
+  keyFacts: string[],
+  importantContext: string | null,
+  agentId = 'main',
+): number {
+  const now = Math.floor(Date.now() / 1000);
+  const result = db.prepare(
+    `INSERT INTO session_handoffs (chat_id, session_id, summary, current_topic, accomplished, work_in_progress, decisions, next_steps, open_questions, blockers, key_facts, important_context, created_at, agent_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    chatId,
+    sessionId ?? null,
+    summary,
+    currentTopic,
+    JSON.stringify(accomplished),
+    JSON.stringify(workInProgress),
+    JSON.stringify(decisions),
+    JSON.stringify(nextSteps),
+    JSON.stringify(openQuestions),
+    JSON.stringify(blockers),
+    JSON.stringify(keyFacts),
+    importantContext,
+    now,
+    agentId,
+  );
+  return result.lastInsertRowid as number;
+}
+
+export function getLatestHandoff(chatId: string, agentId = 'main'): SessionHandoff | null {
+  return (db
+    .prepare(
+      `SELECT * FROM session_handoffs
+       WHERE chat_id = ? AND agent_id = ?
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .get(chatId, agentId) as SessionHandoff | undefined) ?? null;
+}
+
+export function getRecentHandoffs(chatId: string, limit = 3, agentId = 'main'): SessionHandoff[] {
+  return db
+    .prepare(
+      `SELECT * FROM session_handoffs
+       WHERE chat_id = ? AND agent_id = ?
+       ORDER BY created_at DESC LIMIT ?`,
+    )
+    .all(chatId, agentId, limit) as SessionHandoff[];
 }
 
 // ── Inter-Agent Tasks ──────────────────────────────────────────────────

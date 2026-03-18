@@ -192,12 +192,11 @@ export async function runAgent(
         const msgUsage = (ev['message'] as Record<string, unknown>)?.['usage'] as Record<string, number> | undefined;
         const callCacheRead = msgUsage?.['cache_read_input_tokens'] ?? 0;
         const callInputTokens = msgUsage?.['input_tokens'] ?? 0;
-        if (callCacheRead > 0) {
-          lastCallCacheRead = callCacheRead;
-        }
-        if (callInputTokens > 0) {
-          lastCallInputTokens = callInputTokens;
-        }
+        // Always take the latest values — the > 0 guards caused stale data
+        // when cache_read was 0 on the final API call of a turn, making the
+        // percentage wildly inaccurate (mixing values from different calls).
+        lastCallCacheRead = callCacheRead;
+        lastCallInputTokens = callInputTokens;
       }
 
       // Tool progress events — surface to dashboard (not Telegram to avoid spam)

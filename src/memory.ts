@@ -1,6 +1,7 @@
 import { agentObsidianConfig, GOOGLE_API_KEY } from './config.js';
 import {
   decayMemories,
+  getLatestHandoff,
   getRecentConsolidations,
   getRecentHighImportanceMemories,
   logConversationTurn,
@@ -79,14 +80,65 @@ export async function buildMemoryContext(
     }
   }
 
-  if (memLines.length === 0 && insightLines.length === 0 && !agentObsidianConfig) {
+  // Layer 4: Session handoff from previous session
+  const handoff = getLatestHandoff(chatId);
+  const handoffLines: string[] = [];
+  if (handoff) {
+    // Only inject handoffs from the last 48 hours (generous window for overnight work)
+    const handoffAge = Math.floor(Date.now() / 1000) - handoff.created_at;
+    if (handoffAge < 172800) {
+      handoffLines.push(`Summary: ${handoff.summary}`);
+      if (handoff.current_topic) {
+        handoffLines.push(`Last topic: ${handoff.current_topic}`);
+      }
+      if (handoff.important_context) {
+        handoffLines.push(`Context: ${handoff.important_context}`);
+      }
+      const accomplished = safeParse(handoff.accomplished);
+      if (accomplished.length > 0) {
+        handoffLines.push(`Accomplished: ${accomplished.map(a => '• ' + a).join('\n')}`);
+      }
+      const wip = safeParse(handoff.work_in_progress);
+      if (wip.length > 0) {
+        handoffLines.push(`Work in progress: ${wip.map(w => '• ' + w).join('\n')}`);
+      }
+      const decisions = safeParse(handoff.decisions);
+      if (decisions.length > 0) {
+        handoffLines.push(`Decisions: ${decisions.map(d => '• ' + d).join('\n')}`);
+      }
+      const nextSteps = safeParse(handoff.next_steps);
+      if (nextSteps.length > 0) {
+        handoffLines.push(`Next steps: ${nextSteps.map(n => '• ' + n).join('\n')}`);
+      }
+      const openQuestions = safeParse(handoff.open_questions);
+      if (openQuestions.length > 0) {
+        handoffLines.push(`Open questions: ${openQuestions.map(q => '• ' + q).join('\n')}`);
+      }
+      const blockers = safeParse(handoff.blockers);
+      if (blockers.length > 0) {
+        handoffLines.push(`Blockers: ${blockers.map(b => '• ' + b).join('\n')}`);
+      }
+      const keyFacts = safeParse(handoff.key_facts);
+      if (keyFacts.length > 0) {
+        handoffLines.push(`Key facts: ${keyFacts.map(f => '• ' + f).join('\n')}`);
+      }
+    }
+  }
+
+  if (memLines.length === 0 && insightLines.length === 0 && handoffLines.length === 0 && !agentObsidianConfig) {
     return '';
   }
 
   const parts: string[] = [];
 
-  if (memLines.length > 0 || insightLines.length > 0) {
+  if (memLines.length > 0 || insightLines.length > 0 || handoffLines.length > 0) {
     const blocks: string[] = ['[Memory context]'];
+
+    if (handoffLines.length > 0) {
+      blocks.push('Previous session handoff:');
+      blocks.push(...handoffLines);
+      blocks.push('');
+    }
     if (memLines.length > 0) {
       blocks.push('Relevant memories:');
       blocks.push(...memLines);

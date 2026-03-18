@@ -111,12 +111,27 @@ export const AGENT_TIMEOUT_MS = parseInt(
   10,
 );
 
-// Context window limit for the model. Opus 4.6 (1M context) = 1,000,000.
-// Override via CONTEXT_LIMIT in .env if using a different model variant.
-export const CONTEXT_LIMIT = parseInt(
-  process.env.CONTEXT_LIMIT || envConfig.CONTEXT_LIMIT || '1000000',
-  10,
-);
+// Context window limit. Can be overridden via CONTEXT_LIMIT in .env.
+// If not set, contextLimitForModel() derives it from the model name.
+export const CONTEXT_LIMIT_OVERRIDE = process.env.CONTEXT_LIMIT || envConfig.CONTEXT_LIMIT || '';
+
+// 1M-context models (all others are 200K)
+const MILLION_CONTEXT_MODELS = ['claude-opus-4-6', 'claude-sonnet-4-6'];
+
+/**
+ * Get the context window limit for a given model.
+ * Opus 4.6 and Sonnet 4.6 = 1M tokens. Everything else = 200K.
+ * Override with CONTEXT_LIMIT in .env to force a specific value.
+ */
+export function contextLimitForModel(model?: string): number {
+  if (CONTEXT_LIMIT_OVERRIDE) return parseInt(CONTEXT_LIMIT_OVERRIDE, 10);
+  if (model && MILLION_CONTEXT_MODELS.some(m => model.includes(m))) return 1_000_000;
+  // Default to 1M since the bot defaults to Opus 4.6
+  return 1_000_000;
+}
+
+// Backwards compat — default limit used when model isn't known
+export const CONTEXT_LIMIT = contextLimitForModel();
 
 // Dashboard — web UI for monitoring ClaudeClaw state
 export const DASHBOARD_PORT = parseInt(

@@ -148,10 +148,8 @@ async function main(): Promise<void> {
 
   const bot = createBot();
 
-  // Dashboard only runs in the main bot process
-  if (AGENT_ID === 'main') {
-    startDashboard(bot.api);
-  }
+  // Dashboard runs for all agents (needed for Siri Shortcut API access)
+  startDashboard(bot.api);
 
   if (ALLOWED_CHAT_ID) {
     initScheduler(
@@ -175,7 +173,7 @@ async function main(): Promise<void> {
   logger.info({ agentId: AGENT_ID }, 'Starting ClaudeClaw...');
 
   await bot.start({
-    onStart: (botInfo) => {
+    onStart: async (botInfo) => {
       setTelegramConnected(true);
       setBotInfo(botInfo.username ?? '', botInfo.first_name ?? 'ClaudeClaw');
       logger.info({ username: botInfo.username }, 'ClaudeClaw is running');
@@ -187,6 +185,18 @@ async function main(): Promise<void> {
         console.log();
       } else {
         console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online: @${botInfo.username}\n`);
+      }
+
+      // Notify the user that the bot has restarted
+      if (ALLOWED_CHAT_ID) {
+        try {
+          await bot.api.sendMessage(
+            parseInt(ALLOWED_CHAT_ID),
+            `✅ ClaudeClaw restarted successfully.`,
+          );
+        } catch (notifyErr) {
+          logger.warn({ err: notifyErr }, 'Failed to send restart notification');
+        }
       }
     },
   });
