@@ -67,7 +67,7 @@ function getContextReport(chatId: string, sessionId: string | undefined, usage: 
 
   const activeModel = chatModelOverride.get(chatId) ?? agentDefaultModel;
   const limit = contextLimitForModel(activeModel);
-  const contextTokens = usage.lastCallInputTokens + usage.lastCallCacheRead;
+  const contextTokens = usage.lastCallInputTokens + usage.lastCallCacheRead + usage.lastCallCacheCreation;
   const totalK = Math.round(contextTokens / 1000);
   const limitK = Math.round(limit / 1000);
   const pct = contextTokens > 0 ? Math.round((contextTokens / limit) * 100) : 0;

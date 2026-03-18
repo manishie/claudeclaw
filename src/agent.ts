@@ -21,10 +21,16 @@ export interface UsageInfo {
   lastCallCacheRead: number;
   /**
    * The input_tokens from the LAST API call in the turn.
-   * This is the actual context window size: system prompt + conversation
-   * history + tool results for that call. Use this for context warnings.
+   * This is the NON-CACHED input tokens only. Combined with lastCallCacheRead
+   * and lastCallCacheCreation, gives the total context window size.
    */
   lastCallInputTokens: number;
+  /**
+   * The cache_creation_input_tokens from the LAST API call in the turn.
+   * Tokens being newly cached — must be included in context window total
+   * along with input_tokens and cache_read_input_tokens.
+   */
+  lastCallCacheCreation: number;
 }
 
 /** Progress event emitted during agent execution for Telegram feedback. */
@@ -129,6 +135,7 @@ export async function runAgent(
   let preCompactTokens: number | null = null;
   let lastCallCacheRead = 0;
   let lastCallInputTokens = 0;
+  let lastCallCacheCreation = 0;
 
   // Refresh typing indicator on an interval while Claude works.
   // Telegram's "typing..." action expires after ~5s.
@@ -192,11 +199,13 @@ export async function runAgent(
         const msgUsage = (ev['message'] as Record<string, unknown>)?.['usage'] as Record<string, number> | undefined;
         const callCacheRead = msgUsage?.['cache_read_input_tokens'] ?? 0;
         const callInputTokens = msgUsage?.['input_tokens'] ?? 0;
+        const callCacheCreation = msgUsage?.['cache_creation_input_tokens'] ?? 0;
         // Always take the latest values — the > 0 guards caused stale data
         // when cache_read was 0 on the final API call of a turn, making the
         // percentage wildly inaccurate (mixing values from different calls).
         lastCallCacheRead = callCacheRead;
         lastCallInputTokens = callInputTokens;
+        lastCallCacheCreation = callCacheCreation;
       }
 
       // Tool progress events — surface to dashboard (not Telegram to avoid spam)
@@ -234,6 +243,7 @@ export async function runAgent(
             preCompactTokens,
             lastCallCacheRead,
             lastCallInputTokens,
+            lastCallCacheCreation,
           };
           logger.info(
             {
@@ -241,6 +251,7 @@ export async function runAgent(
               cacheReadTokens: usage.cacheReadInputTokens,
               lastCallCacheRead: usage.lastCallCacheRead,
               lastCallInputTokens: usage.lastCallInputTokens,
+              lastCallCacheCreation: usage.lastCallCacheCreation,
               costUsd: usage.totalCostUsd,
               didCompact,
             },
