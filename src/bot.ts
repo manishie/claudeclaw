@@ -3,6 +3,8 @@ import path from 'path';
 import os from 'os';
 import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
 
+import type { ClawAPI, MessageContext } from './plugin-api.js';
+
 import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
 import {
   AGENT_ID,
@@ -27,6 +29,9 @@ import { buildMemoryContext, saveConversationTurn } from './memory.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
+
+// Plugin system -- set by createBot() when plugins are loaded
+let _plugins: ClawAPI | undefined;
 
 // ── Context window tracking ──────────────────────────────────────────
 // Uses input_tokens from the last API call (= actual context window size:
@@ -313,7 +318,17 @@ async function sendResult(
   skipLog: boolean,
 ): Promise<void> {
   const rawResponse = result.text?.trim() || 'Done.';
-  const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
+  const { text: extractedText, files: fileMarkers } = extractFileMarkers(rawResponse);
+
+  // Plugin afterAgent hooks
+  let responseText = extractedText;
+  if (_plugins) {
+    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message, ctx: null as unknown as Context, sessionId };
+    for (const hook of _plugins._afterAgent) {
+      const modified = await hook(mc, { text: responseText });
+      if (typeof modified === 'string') responseText = modified;
+    }
+  }
 
   if (!skipLog) {
     saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
@@ -517,9 +532,19 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
   }
 
   parts.push(message);
-  const fullMessage = parts.join('\n\n');
+  let fullMessage = parts.join('\n\n');
 
   const sessionId = getSession(chatIdStr, AGENT_ID);
+
+  // Plugin beforeAgent hooks
+  if (_plugins) {
+    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message: fullMessage, ctx, sessionId };
+    for (const hook of _plugins._beforeAgent) {
+      const hookResult = await hook(mc);
+      if (hookResult && typeof hookResult === 'object' && 'handled' in hookResult) return;
+      if (typeof hookResult === 'string') fullMessage = hookResult;
+    }
+  }
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -797,7 +822,9 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
   return commands.sort((a, b) => a.command.localeCompare(b.command));
 }
 
-export function createBot(): Bot {
+export function createBot(plugins?: ClawAPI): Bot {
+  _plugins = plugins;
+
   const token = activeBotToken;
   if (!token) {
     throw new Error('Bot token is not set. Check .env or agent config.');
@@ -805,7 +832,7 @@ export function createBot(): Bot {
 
   const bot = new Bot(token);
 
-  // Register commands in the Telegram menu (built-in + auto-discovered skills)
+  // Register commands in the Telegram menu (built-in + plugins + auto-discovered skills)
   const builtInCommands = [
     { command: 'start', description: 'Start the bot' },
     { command: 'help', description: 'Help -- list available commands' },
@@ -823,9 +850,21 @@ export function createBot(): Bot {
     { command: 'delegate', description: 'Delegate task to agent' },
   ];
   const skillCommands = discoverSkillCommands();
-  const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
+
+  // Register plugin commands
+  if (_plugins) {
+    for (const cmd of _plugins._commands) {
+      bot.command(cmd.name, (ctx) => {
+        if (!isAuthorised(ctx.chat!.id)) return;
+        return cmd.handler(ctx);
+      });
+    }
+  }
+
+  const pluginMenuEntries = _plugins?._menuEntries ?? [];
+  const allCommands = [...builtInCommands, ...skillCommands, ...pluginMenuEntries].slice(0, 100);
   bot.api.setMyCommands(allCommands)
-    .then(() => logger.info({ count: skillCommands.length }, 'Registered %d skill commands with Telegram', skillCommands.length))
+    .then(() => logger.info({ plugins: pluginMenuEntries.length, skills: skillCommands.length }, 'Registered commands with Telegram'))
     .catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
 
   // /help — list available commands
@@ -1209,6 +1248,9 @@ export function createBot(): Bot {
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
   const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/switch', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/status']);
+  if (_plugins) {
+    for (const cmd of _plugins._commands) OWN_COMMANDS.add(`/${cmd.name}`);
+  }
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();

@@ -146,7 +146,11 @@ async function main(): Promise<void> {
 
   cleanupOldUploads();
 
-  const bot = createBot();
+  // Load plugins
+  const { loadPlugins } = await import('./plugin-loader.js');
+  const plugins = await loadPlugins();
+
+  const bot = createBot(plugins);
 
   // Dashboard runs for all agents (needed for Siri Shortcut API access)
   startDashboard(bot.api);
@@ -160,8 +164,30 @@ async function main(): Promise<void> {
     logger.warn('ALLOWED_CHAT_ID not set — scheduler disabled (no destination for results)');
   }
 
+  // Start plugin boot services
+  for (const svc of plugins._bootServices) {
+    try {
+      await svc.init(bot.api);
+      logger.info({ service: svc.name }, 'Plugin service started');
+    } catch (err) {
+      logger.error({ err, service: svc.name }, 'Plugin service failed to start');
+    }
+  }
+
+  // Start plugin intervals
+  const pluginIntervals: ReturnType<typeof setInterval>[] = [];
+  for (const iv of plugins._intervals) {
+    pluginIntervals.push(setInterval(() => {
+      Promise.resolve(iv.fn()).catch(err => logger.error({ err, interval: iv.name }, 'Plugin interval error'));
+    }, iv.ms));
+  }
+
   const shutdown = async () => {
     logger.info('Shutting down...');
+    for (const hook of plugins._shutdownHooks) {
+      try { await hook(); } catch { /* best effort */ }
+    }
+    for (const iv of pluginIntervals) clearInterval(iv);
     setTelegramConnected(false);
     releaseLock();
     await bot.stop();

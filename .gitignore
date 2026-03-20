@@ -40,3 +40,7 @@ scripts/waste-reminder.sh
 CLAUDE.md
 agents/*/agent.yaml
 agents/*/CLAUDE.md
+
+# Plugins — custom plugins and plugin selection are user-specific
+src/plugins/custom/
+plugins.json
