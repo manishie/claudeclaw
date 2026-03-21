@@ -2,6 +2,11 @@
 
 All notable changes to ClaudeClaw will be documented here.
 
+## [v1.2.0] - 2026-03-21
+
+### Added
+- Plugin system for extending ClaudeClaw without modifying core files
+
 ## [v1.1.1] - 2026-03-06
 
 ### Added
