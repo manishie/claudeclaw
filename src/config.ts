@@ -19,6 +19,9 @@ const envConfig = readEnvFile([
   'CLAUDECLAW_CONFIG',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
+  'BACKGROUND_PROMOTE_ALL',
+  'AGENT_TIMEOUT_MS',
+  'RESEARCH_WRAPPER_PATH',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────

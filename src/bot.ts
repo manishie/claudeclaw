@@ -3,6 +3,7 @@ import path from 'path';
 import os from 'os';
 import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
 
+import type { ClawAPI, MessageContext } from './plugin-api.js';
 import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
 import {
   AGENT_ID,
@@ -28,6 +29,9 @@ import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
 
+// Plugin system — set by createBot() when plugins are loaded
+let _plugins: ClawAPI | undefined;
+
 // ── Context window tracking ──────────────────────────────────────────
 // Uses input_tokens from the last API call (= actual context window size:
 // system prompt + conversation history + tool results for that call).
@@ -50,6 +54,23 @@ interface BackgroundTask {
 const backgroundTasks = new Map<string, BackgroundTask>(); // chatId -> active task
 
 const lastUsage = new Map<string, UsageInfo>();
+
+// Full Telegram-allowed reaction emoji pool (75 emojis) — no back-to-back repeats
+const ACK_EMOJIS = [
+  '👍','👎','❤','🔥','🥰','👏','😁','🤔','🤯','😱','🤬','😢','🎉','🤩',
+  '🤮','💩','🙏','👌','🕊','🤡','🥱','🥴','😍','🐳','❤‍🔥','🌚','🌭',
+  '💯','🤣','⚡','🍌','🏆','💔','🤨','😐','🍓','🍾','💋','🖕','😈','😴',
+  '😭','🤓','👻','👨‍💻','👀','🎃','🙈','😇','😨','🤝','✍','🤗','🫡',
+  '🎅','🎄','☃','💅','🤪','🗿','🆒','💘','🙉','🦄','😘','💊','🙊','😎',
+  '👾','🤷‍♂','🤷','🤷‍♀','😡',
+];
+let lastAckEmoji = '';
+function pickAckEmoji(): string {
+  const pool = ACK_EMOJIS.filter(e => e !== lastAckEmoji);
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  lastAckEmoji = pick;
+  return pick;
+}
 
 /**
  * Get context usage report. Shows total context window usage as a percentage
@@ -311,9 +332,9 @@ async function sendResult(
   sessionId: string | undefined,
   forceVoiceReply: boolean,
   skipLog: boolean,
+  ctx?: Context,
 ): Promise<void> {
   const rawResponse = result.text?.trim() || 'Done.';
-  const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
 
   if (!skipLog) {
     saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
@@ -321,24 +342,17 @@ async function sendResult(
 
   emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'telegram' });
 
-  // Send any attached files
-  for (const file of fileMarkers) {
-    try {
-      if (!fs.existsSync(file.filePath)) {
-        await api.sendMessage(chatId, `Could not send file: ${file.filePath} (not found)`);
-        continue;
-      }
-      const input = new InputFile(file.filePath);
-      if (file.type === 'photo') {
-        await api.sendPhoto(chatId, input, file.caption ? { caption: file.caption } : undefined);
-      } else {
-        await api.sendDocument(chatId, input, file.caption ? { caption: file.caption } : undefined);
-      }
-    } catch (fileErr) {
-      logger.error({ err: fileErr, filePath: file.filePath }, 'Failed to send file via Telegram');
-      await api.sendMessage(chatId, `Failed to send file: ${file.filePath}`);
+  // Plugin afterAgent hooks — extract markers, send files/reactions, transform text
+  let responseText = rawResponse;
+  if (_plugins && ctx) {
+    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message, ctx, sessionId };
+    for (const hook of _plugins._afterAgent) {
+      const modified = await hook(mc, { text: responseText });
+      if (typeof modified === 'string') responseText = modified;
     }
   }
+  // If plugin returned empty string (reaction-only), skip text delivery
+  if (responseText === '') return;
 
   // Voice or text response
   // Split on '---' delimiter for semantic multi-message delivery.
@@ -434,6 +448,18 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     'Processing message',
   );
 
+  // Auto-react to acknowledge receipt with a random emoji (no repeats)
+  // Skip for voice messages — voice handler already set the reaction
+  const isVoice = message.startsWith('[Voice transcribed]:');
+  const ackEmoji = pickAckEmoji();
+  const msgId = ctx.message?.message_id;
+  if (msgId && !isVoice) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await ctx.api.setMessageReaction(chatId, msgId, [{ type: 'emoji', emoji: ackEmoji } as any]);
+    } catch { /* best effort */ }
+  }
+
   // Emit user message to SSE clients
   emitChatEvent({ type: 'user_message', chatId: chatIdStr, content: message, source: 'telegram' });
 
@@ -482,6 +508,13 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   let typingInterval: ReturnType<typeof setInterval> | undefined;
   try {
 
+  // Start typing immediately — before memory context build which can take seconds
+  await sendTyping(ctx.api, chatId);
+  typingInterval = setInterval(
+    () => void sendTyping(ctx.api, chatId),
+    TYPING_REFRESH_MS,
+  );
+
   // Build memory context and prepend to message
   const memCtx = await buildMemoryContext(chatIdStr, message);
   const parts: string[] = [];
@@ -499,38 +532,27 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     parts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
   }
 
-  // Detect research intent and run structural bash wrapper
-  const RESEARCH_PATTERN = /\b(research topic|deep research|research advisor|run.*advisor|full research|comprehensive research)\b/i;
-  const isResearchRequest = RESEARCH_PATTERN.test(message);
-  if (isResearchRequest) {
-    parts.push(`[MANDATORY RESEARCH PROTOCOL: The user is requesting research.
-
-1. Determine the topic name from the user's message (kebab-case, 2-3 words).
-2. Determine the directive (what specific research questions to answer), or leave empty for general research.
-3. Run this EXACT command via Bash — do NOT invoke skills yourself:
-   bash /home/node/projects/hub/scripts/research-wrapper.sh "<topic-name>" "<directive>"
-4. The script handles everything: scaffolding, advisor invocation, status tracking, commit, and push.
-5. After the script completes, read /tmp/research-driver-result.json and summarize the key findings for the user.
-6. If the script fails, read /tmp/research-driver-result.json for the error details.
-
-Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-research-driver directly. The wrapper script is mandatory.]`);
-  }
-
   parts.push(message);
-  const fullMessage = parts.join('\n\n');
+  let fullMessage = parts.join('\n\n');
 
-  const sessionId = getSession(chatIdStr, AGENT_ID);
+  let sessionId = getSession(chatIdStr, AGENT_ID);
 
-  // Start typing immediately, then refresh on interval
-  await sendTyping(ctx.api, chatId);
-  typingInterval = setInterval(
-    () => void sendTyping(ctx.api, chatId),
-    TYPING_REFRESH_MS,
-  );
+  // Plugin beforeAgent hooks — can intercept (e.g. research auto-dispatch)
+  if (_plugins) {
+    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message: fullMessage, ctx, sessionId };
+    for (const hook of _plugins._beforeAgent) {
+      const hookResult = await hook(mc);
+      if (hookResult && typeof hookResult === 'object' && 'handled' in hookResult) {
+        setProcessing(chatIdStr, false);
+        return;
+      }
+      if (typeof hookResult === 'string') fullMessage = hookResult;
+    }
+  }
 
   setProcessing(chatIdStr, true);
 
-  try {
+  for (let _attempt = 0; _attempt < 2; _attempt++) { try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
     // Buffer progress events that arrive before background promotion
     const earlyProgress: AgentProgressEvent[] = [];
@@ -568,7 +590,8 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
     let promoteResolve: (() => void) | null = null;
     const promotePromise = new Promise<void>((resolve) => { promoteResolve = resolve; });
 
-    const ackTimeout = !isResearchRequest ? null : setTimeout(async () => {
+    const backgroundPromoteAll = process.env.BACKGROUND_PROMOTE_ALL === 'true';
+    const ackTimeout = !backgroundPromoteAll ? null : setTimeout(async () => {
       promoted = true;
       backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), phases: [], activity: 'Starting...' });
       // Replay any progress events that arrived before promotion
@@ -614,39 +637,36 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
       clearInterval(typingInterval);
 
       if (result.aborted) {
-        // Check if research completed before the timeout killed the process
+        // Plugin abort recovery hooks — give plugins a chance to salvage results
         let recovered = false;
-        try {
-          const resultJson = fs.readFileSync('/tmp/research-driver-result.json', 'utf-8');
-          const parsed = JSON.parse(resultJson) as { status?: string; topic?: string; report_path?: string; executive_summary?: string; timestamp?: string };
-          if (parsed.status === 'complete' && parsed.executive_summary) {
-            const summary = [
-              '✅ Research completed (recovered after timeout)',
-              '',
-              `**Report:** \`${parsed.report_path}\``,
-              '',
-              parsed.executive_summary,
-            ].join('\n');
-            emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: summary, source: 'telegram' });
-            for (const part of splitMessage(formatForTelegram(summary))) {
-              await ctx.api.sendMessage(chatId, part, { parse_mode: 'HTML' });
-            }
-            // Send report as file attachment — prefer PDF, fall back to markdown
-            const filePath = (parsed as Record<string, unknown>).pdf_path as string | null || parsed.report_path;
-            if (filePath && fs.existsSync(filePath)) {
-              try {
-                await ctx.api.sendDocument(chatId, new InputFile(filePath), {
-                  caption: `Research report: ${parsed.topic}`,
-                });
-              } catch (fileErr) {
-                logger.warn({ err: fileErr }, 'Failed to send report file');
+        if (_plugins) {
+          for (const hook of _plugins._abortRecovery) {
+            try {
+              const recovery = await hook({ chatId: chatIdStr, chatIdNum: chatId });
+              if (recovery) {
+                emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: recovery.text, source: 'telegram' });
+                for (const part of splitMessage(formatForTelegram(recovery.text))) {
+                  await ctx.api.sendMessage(chatId, part, { parse_mode: 'HTML' });
+                }
+                for (const file of recovery.files ?? []) {
+                  try {
+                    if (fs.existsSync(file.path)) {
+                      await ctx.api.sendDocument(chatId, new InputFile(file.path), {
+                        caption: file.caption,
+                      });
+                    }
+                  } catch (fileErr) {
+                    logger.warn({ err: fileErr }, 'Failed to send recovery file');
+                  }
+                }
+                recovered = true;
+                break;
               }
+            } catch (hookErr) {
+              logger.warn({ err: hookErr }, 'Abort recovery hook failed');
             }
-            // Clean up the result file
-            try { fs.unlinkSync('/tmp/research-driver-result.json'); } catch { /* */ }
-            recovered = true;
           }
-        } catch { /* no result file or invalid JSON */ }
+        }
 
         if (!recovered) {
           setProcessing(chatIdStr, false);
@@ -679,8 +699,8 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
 
     // If promoted to background: release the queue now, deliver result later
     // If not promoted: wait for result inline (normal fast path)
-    // Only race with promotion promise for research requests
-    const result = isResearchRequest
+    // Race with promotion promise when background promotion is enabled
+    const result = backgroundPromoteAll
       ? await Promise.race([agentPromise, promotePromise.then(() => null as null)])
       : await agentPromise;
 
@@ -689,7 +709,14 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
       agentPromise.then(
         async (bgResult) => {
           await deliverResult(bgResult);
-          await sendResult(ctx.api, chatId, chatIdStr, bgResult, message, sessionId, forceVoiceReply, skipLog);
+          await sendResult(ctx.api, chatId, chatIdStr, bgResult, message, sessionId, forceVoiceReply, skipLog, ctx);
+          // Swap reaction to ✅ (done)
+          if (msgId) {
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              await ctx.api.setMessageReaction(chatId, msgId, [{ type: 'emoji', emoji: '✅' } as any]);
+            } catch { /* best effort */ }
+          }
           backgroundTasks.delete(chatIdStr);
           setProcessing(chatIdStr, false);
           logger.info({ chatId: chatIdStr }, 'Background task completed');
@@ -706,17 +733,31 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
 
     // Fast path — responded within 15s
     await deliverResult(result);
-    await sendResult(ctx.api, chatId, chatIdStr, result, message, sessionId, forceVoiceReply, skipLog);
+    await sendResult(ctx.api, chatId, chatIdStr, result, message, sessionId, forceVoiceReply, skipLog, ctx);
+    // Swap reaction to ✅ (done)
+    if (msgId) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await ctx.api.setMessageReaction(chatId, msgId, [{ type: 'emoji', emoji: '✅' } as any]);
+      } catch { /* best effort */ }
+    }
     setProcessing(chatIdStr, false);
+    break; // success — exit retry loop
   } catch (err) {
     clearInterval(typingInterval);
     setActiveAbort(chatIdStr, null);
     setProcessing(chatIdStr, false);
     logger.error({ err }, 'Agent error');
 
-    // Detect context window exhaustion (process exits with code 1 after long sessions)
+    // Detect stale session (e.g. after container restart wiped Claude Code state)
     const errMsg = err instanceof Error ? err.message : String(err);
-    if (errMsg.includes('exited with code 1')) {
+    if (errMsg.includes('No conversation found with session ID') && _attempt === 0) {
+      logger.warn({ chatId: chatIdStr, sessionId }, 'Stale session detected — clearing and retrying');
+      clearSession(chatIdStr, AGENT_ID);
+      sessionId = undefined;
+      continue; // retry the whole try block with no session
+    } else if (errMsg.includes('exited with code 1')) {
+      // Detect context window exhaustion (process exits with code 1 after long sessions)
       const usage = lastUsage.get(chatIdStr);
       const contextSize = usage?.lastCallInputTokens || usage?.lastCallCacheRead || 0;
       if (contextSize > 0) {
@@ -731,7 +772,8 @@ Do NOT run research yourself. Do NOT invoke /mkm-research-advisor or /mkm-resear
     } else {
       await ctx.reply('Something went wrong. Check the logs and try again.');
     }
-  }
+    break; // non-retryable error — exit retry loop
+  } } // end for retry loop
 
   // Outer catch: covers pre-agent code (memory context building, session lookup,
   // typing setup). Without this, errors in that code silently swallow the message.
@@ -797,13 +839,17 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
   return commands.sort((a, b) => a.command.localeCompare(b.command));
 }
 
-export function createBot(): Bot {
+export function createBot(plugins?: ClawAPI): Bot {
+  _plugins = plugins;
   const token = activeBotToken;
   if (!token) {
     throw new Error('Bot token is not set. Check .env or agent config.');
   }
 
   const bot = new Bot(token);
+
+  // Give the message queue access to bot API for typing indicators on queued messages
+  messageQueue.setBotApi(bot.api);
 
   // Register commands in the Telegram menu (built-in + auto-discovered skills)
   const builtInCommands = [
@@ -823,7 +869,18 @@ export function createBot(): Bot {
     { command: 'delegate', description: 'Delegate task to agent' },
   ];
   const skillCommands = discoverSkillCommands();
-  const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
+
+  // Register plugin commands
+  if (_plugins) {
+    for (const cmd of _plugins._commands) {
+      bot.command(cmd.name, (ctx) => {
+        if (!isAuthorised(ctx.chat!.id)) return;
+        return cmd.handler(ctx);
+      });
+    }
+  }
+  const pluginMenuEntries = _plugins?._menuEntries ?? [];
+  const allCommands = [...builtInCommands, ...skillCommands, ...pluginMenuEntries].slice(0, 100);
   bot.api.setMyCommands(allCommands)
     .then(() => logger.info({ count: skillCommands.length }, 'Registered %d skill commands with Telegram', skillCommands.length))
     .catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
@@ -976,26 +1033,22 @@ export function createBot(): Bot {
     const secs = elapsed % 60;
     const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
-    // Read wrapper status
-    let wrapperStatus = '';
-    try { wrapperStatus = fs.readFileSync('/tmp/research-status.txt', 'utf-8').trim(); } catch { /* */ }
-
-    // Read last line of trace log for real-time advisor progress
-    let traceStatus = '';
-    try {
-      const traceFiles = fs.readdirSync('/tmp').filter((f: string) => f.startsWith('ra-') && f.endsWith('-trace.log'));
-      if (traceFiles.length > 0) {
-        const latest = traceFiles.sort().pop()!;
-        const content = fs.readFileSync(`/tmp/${latest}`, 'utf-8').trim();
-        const lines = content.split('\n');
-        traceStatus = lines[lines.length - 1] || '';
-      }
-    } catch { /* */ }
-
     const parts = [`⏳ ${timeStr}`];
-    if (wrapperStatus) parts.push(`📍 ${wrapperStatus}`);
-    if (traceStatus) parts.push(`🔎 ${traceStatus.slice(0, 120)}`);
-    if (!wrapperStatus && !traceStatus) parts.push(`🔄 ${task.activity || 'Starting...'}`);
+
+    // Plugin status providers — extra detail lines
+    let hasPluginStatus = false;
+    if (_plugins) {
+      for (const provider of _plugins._statusProviders) {
+        try {
+          const extra = provider();
+          if (extra.length > 0) {
+            parts.push(...extra);
+            hasPluginStatus = true;
+          }
+        } catch { /* */ }
+      }
+    }
+    if (!hasPluginStatus) parts.push(`🔄 ${task.activity || 'Starting...'}`);
     await ctx.reply(parts.join('\n'));
   });
 
@@ -1415,16 +1468,21 @@ export function createBot(): Bot {
     }
 
     try {
+      // Show typing immediately during download + transcription
+      await sendTyping(ctx.api, chatId);
       const fileId = ctx.message.voice.file_id;
       const localPath = await downloadTelegramFile(activeBotToken, fileId, UPLOADS_DIR);
+      await sendTyping(ctx.api, chatId); // refresh after download
       const transcribed = await transcribeAudio(localPath);
       const chatIdStr = ctx.chat!.id.toString();
 
-      // Instant acknowledgment: thumbs up so the user knows we got it
-      try {
-        await ctx.reply('👍🏾');
-      } catch (ackErr) {
-        logger.warn({ err: ackErr }, 'Voice ack failed (non-fatal)');
+      // Acknowledge receipt with a reaction (same as text messages)
+      const voiceMsgId = ctx.message?.message_id;
+      if (voiceMsgId) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await ctx.api.setMessageReaction(chatId, voiceMsgId, [{ type: 'emoji', emoji: pickAckEmoji() } as any]);
+        } catch { /* best effort */ }
       }
 
       // Voice shortcut: "status" → scripted status (no Claude)
@@ -1438,22 +1496,22 @@ export function createBot(): Bot {
           const mins = Math.floor(elapsed / 60);
           const secs = elapsed % 60;
           const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-          let wrapperStatus = '';
-          let traceStatus = '';
-          try { wrapperStatus = fs.readFileSync('/tmp/research-status.txt', 'utf-8').trim(); } catch { /* */ }
-          try {
-            const traceFiles = fs.readdirSync('/tmp').filter((f: string) => f.startsWith('ra-') && f.endsWith('-trace.log'));
-            if (traceFiles.length > 0) {
-              const content = fs.readFileSync(`/tmp/${traceFiles.sort().pop()!}`, 'utf-8').trim();
-              const lines = content.split('\n');
-              traceStatus = lines[lines.length - 1] || '';
+          // Plugin status providers
+          let pluginDetail = '';
+          if (_plugins) {
+            for (const provider of _plugins._statusProviders) {
+              try {
+                const extra = provider();
+                if (extra.length > 0) {
+                  pluginDetail = extra[0].replace(/^[^\s]+\s*/, ''); // strip emoji prefix for voice
+                  break;
+                }
+              } catch { /* */ }
             }
-          } catch { /* */ }
-          statusMsg = traceStatus
-            ? `${timeStr}. ${traceStatus.slice(0, 100)}`
-            : wrapperStatus
-              ? `${timeStr}. ${wrapperStatus}`
-              : `${timeStr}. ${task.activity || 'Starting.'}`;
+          }
+          statusMsg = pluginDetail
+            ? `${timeStr}. ${pluginDetail.slice(0, 100)}`
+            : `${timeStr}. ${task.activity || 'Starting.'}`;
         }
         try {
           const audioBuffer = await synthesizeSpeech(statusMsg);
@@ -1662,8 +1720,25 @@ async function processDashboardMessage(
     // Emit assistant response to SSE clients
     emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'dashboard' });
 
+    // Run plugin afterAgent hooks (file markers, reactions, text transforms)
+    // This ensures dashboard messages get the same processing as Telegram messages.
+    let responseText = rawResponse;
+    if (_plugins) {
+      // Dashboard doesn't have a Grammy Context, so we create a minimal shim
+      const chatIdNum = parseInt(chatIdStr);
+      const shimMc: import('./plugin-api.js').MessageContext = {
+        chatId: chatIdStr,
+        chatIdNum,
+        message: text,
+        ctx: { api: botApi, message: { message_id: 0 } } as any, // eslint-disable-line @typescript-eslint/no-explicit-any
+        sessionId,
+      };
+      for (const hook of _plugins._afterAgent) {
+        const modified = await hook(shimMc, { text: responseText });
+        if (typeof modified === 'string') responseText = modified;
+      }
+    }
     // Relay to Telegram so the user sees it there too
-    const { text: responseText } = extractFileMarkers(rawResponse);
     if (responseText) {
       for (const part of splitMessage(formatForTelegram(responseText))) {
         await botApi.sendMessage(parseInt(chatIdStr), part, { parse_mode: 'HTML' });

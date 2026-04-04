@@ -121,12 +121,14 @@ When [YOUR NAME] asks you to create a file and send it to them (PDF, spreadsheet
 - `[SEND_FILE:/absolute/path/to/file.pdf|Optional caption here]` — with a caption
 
 **Rules:**
-- Always use absolute paths
+- Always use absolute paths for file markers
 - Create the file first (using Write tool, a skill, or Bash), then include the marker
 - Place markers on their own line when possible
 - You can include multiple markers to send multiple files
 - The marker text gets stripped from the message — write your normal response text around it
 - Max file size: 50MB (Telegram limit)
+
+**Note:** Reactions are handled automatically by the bot. Every message gets 👀 when processing starts, then ✅ when the response is delivered. You do NOT need to add reaction markers.
 
 **Example response:**
 ```
