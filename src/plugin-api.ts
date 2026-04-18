@@ -4,7 +4,10 @@ import type { Api, Context, RawApi } from 'grammy';
 export interface MessageContext {
   chatId: string;
   chatIdNum: number;
+  /** The full message sent to the agent (includes system prompt, memory, user text). */
   message: string;
+  /** The raw user message, without system prompt or memory context. Use this for user-intent detection. */
+  userMessage: string;
   ctx: Context;
   sessionId: string | undefined;
 }

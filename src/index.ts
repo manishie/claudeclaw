@@ -13,6 +13,8 @@ import { runDecaySweep } from './memory.js';
 import { initMastraMemory } from './mastra-memory.js';
 import { initOrchestrator } from './orchestrator.js';
 import { initScheduler } from './scheduler.js';
+import { initBullMQScheduler, shutdownBullMQ } from './bullmq-scheduler.js';
+import { initLangfuse, shutdownLangfuse } from './langfuse.js';
 import { setTelegramConnected, setBotInfo } from './state.js';
 
 // Parse --agent flag
@@ -123,6 +125,9 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database ready');
 
+  // Initialize Langfuse observability (gracefully no-ops if keys not set)
+  initLangfuse();
+
   initOrchestrator();
 
   runDecaySweep();
@@ -149,10 +154,17 @@ async function main(): Promise<void> {
   startDashboard(bot.api);
 
   if (ALLOWED_CHAT_ID) {
-    initScheduler(
-      (text) => bot.api.sendMessage(ALLOWED_CHAT_ID, text, { parse_mode: 'HTML' }).then(() => {}).catch((err) => logger.error({ err }, 'Scheduler failed to send message')),
-      AGENT_ID,
-    );
+    const schedulerSend = (text: string) =>
+      bot.api.sendMessage(ALLOWED_CHAT_ID, text, { parse_mode: 'HTML' }).then(() => {}).catch((err: unknown) => logger.error({ err }, 'Scheduler failed to send message'));
+
+    // Try BullMQ scheduler first (Redis-backed), fall back to SQLite poller
+    try {
+      await initBullMQScheduler(schedulerSend, AGENT_ID);
+      logger.info('Using BullMQ scheduler (Redis-backed)');
+    } catch (bullmqErr) {
+      logger.warn({ err: bullmqErr }, 'BullMQ init failed — falling back to SQLite scheduler');
+      initScheduler(schedulerSend, AGENT_ID);
+    }
   } else {
     logger.warn('ALLOWED_CHAT_ID not set — scheduler disabled (no destination for results)');
   }
@@ -181,6 +193,8 @@ async function main(): Promise<void> {
       try { await hook(); } catch { /* best effort */ }
     }
     for (const iv of pluginIntervals) clearInterval(iv);
+    await shutdownBullMQ();
+    await shutdownLangfuse();
     setTelegramConnected(false);
     releaseLock();
     await bot.stop();

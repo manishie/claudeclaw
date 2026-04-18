@@ -146,7 +146,7 @@ Analyze the conversation turns below and extract ALL of the following:
 6. **next_steps**: Array of things that need to happen next, in priority order. Be specific and actionable. Example: "Lower handoff threshold from 80% to 70% in bot.ts line 389"
 7. **open_questions**: Array of unresolved questions that need user input or further investigation. Example: "Should we keep per-turn memory extraction alongside the structured handoff?"
 8. **blockers**: Array of things blocked on external dependencies. Example: "Hub changes need git push from VPS and pull on desktop" — or empty array if none.
-9. **key_facts**: Array of important numbers, values, paths, or technical details the next session needs. Example: "Context limit is 1M tokens for Opus 4.6", "ClaudeClaw DB at /home/node/claudeclaw/store/claudeclaw.db"
+9. **key_facts**: Array of important numbers, values, paths, or technical details the next session needs. Example: "Context limit is 1M tokens for Opus 4.6", "ClaudeClaw DB at /home/admin/claudeclaw/store/claudeclaw.db"
 10. **important_context**: Freeform context about the user's situation, communication mode, constraints. Example: "User is driving and communicating via voice notes. Keep responses concise." Null if nothing special.
 
 RULES:

@@ -5,6 +5,7 @@ import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
 
 import type { ClawAPI, MessageContext } from './plugin-api.js';
 import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
+import { traceTurn, recordGeneration } from './langfuse.js';
 import {
   AGENT_ID,
   ALLOWED_CHAT_ID,
@@ -335,6 +336,8 @@ async function sendResult(
   forceVoiceReply: boolean,
   skipLog: boolean,
   ctx?: Context,
+  langfuseTrace?: ReturnType<typeof traceTurn>,
+  turnStartMs?: number,
 ): Promise<void> {
   const rawResponse = result.text?.trim() || 'Done.';
 
@@ -347,7 +350,7 @@ async function sendResult(
   // Plugin afterAgent hooks — extract markers, send files/reactions, transform text
   let responseText = rawResponse;
   if (_plugins && ctx) {
-    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message, ctx, sessionId };
+    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message, userMessage: message, ctx, sessionId };
     for (const hook of _plugins._afterAgent) {
       const modified = await hook(mc, { text: responseText });
       if (typeof modified === 'string') responseText = modified;
@@ -391,7 +394,7 @@ async function sendResult(
     }
   }
 
-  // Context tracking
+  // Context tracking + Langfuse observability
   if (result.usage) {
     const activeSessionId = result.newSessionId ?? sessionId;
     try {
@@ -399,6 +402,18 @@ async function sendResult(
     } catch (dbErr) {
       logger.error({ err: dbErr }, 'Failed to save token usage');
     }
+
+    // Record to Langfuse (no-ops if not configured)
+    recordGeneration(langfuseTrace ?? null, {
+      output: result.text,
+      model: chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      cacheReadTokens: result.usage.cacheReadInputTokens,
+      totalCostUsd: result.usage.totalCostUsd,
+      durationMs: Date.now() - (turnStartMs ?? Date.now()),
+      didCompact: result.usage.didCompact,
+    });
 
     const contextReport = getContextReport(chatIdStr, activeSessionId, result.usage);
     if (contextReport.status) {
@@ -551,7 +566,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
   // Plugin beforeAgent hooks — can intercept (e.g. research auto-dispatch)
   if (_plugins) {
-    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message: fullMessage, ctx, sessionId };
+    const mc: MessageContext = { chatId: chatIdStr, chatIdNum: chatId, message: fullMessage, userMessage: message, ctx, sessionId };
     for (const hook of _plugins._beforeAgent) {
       const hookResult = await hook(mc);
       if (hookResult && typeof hookResult === 'object' && 'handled' in hookResult) {
@@ -709,7 +724,16 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       }
     };
 
-    // Start the agent query
+    // Start the agent query (with Langfuse tracing)
+    const turnTrace = traceTurn({
+      chatId: chatIdStr,
+      sessionId: sessionId ?? undefined,
+      message: fullMessage,
+      model: chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
+      agentId: AGENT_ID,
+    });
+    const turnStartMs = Date.now();
+
     const agentPromise = runAgent(
       fullMessage,
       sessionId,
@@ -731,7 +755,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       agentPromise.then(
         async (bgResult) => {
           await deliverResult(bgResult);
-          await sendResult(ctx.api, chatId, chatIdStr, bgResult, message, sessionId, forceVoiceReply, skipLog, ctx);
+          await sendResult(ctx.api, chatId, chatIdStr, bgResult, message, sessionId, forceVoiceReply, skipLog, ctx, turnTrace, turnStartMs);
           // Swap reaction to ✅ (done)
           if (msgId) {
             try {
@@ -755,7 +779,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
     // Fast path — responded within 15s
     await deliverResult(result);
-    await sendResult(ctx.api, chatId, chatIdStr, result, message, sessionId, forceVoiceReply, skipLog, ctx);
+    await sendResult(ctx.api, chatId, chatIdStr, result, message, sessionId, forceVoiceReply, skipLog, ctx, turnTrace, turnStartMs);
     // Swap reaction to ✅ (done)
     if (msgId) {
       try {
@@ -1763,6 +1787,7 @@ async function processDashboardMessage(
         chatId: chatIdStr,
         chatIdNum,
         message: text,
+        userMessage: text,
         ctx: { api: botApi, message: { message_id: 0 } } as any, // eslint-disable-line @typescript-eslint/no-explicit-any
         sessionId,
       };

@@ -17,7 +17,7 @@ import { getRecentHighImportanceMemories, getLatestHandoff, type Memory, type Se
 import { logger } from './logger.js';
 
 // The shared facts file — desktop reads this via session-start.sh hook
-const RESEARCH_REPO = '/home/node/projects/research';
+const RESEARCH_REPO = '/home/admin/projects/research';
 const FACTS_FILE = path.join(RESEARCH_REPO, '.claude', 'auto-extracted-facts.md');
 
 function safeParse(json: string | null): string[] {

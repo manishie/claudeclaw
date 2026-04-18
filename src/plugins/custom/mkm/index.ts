@@ -49,7 +49,11 @@ function extractMarkers(text: string): ExtractResult {
 
 // ── Research detection ────────────────────────────────────────────────
 
-const RESEARCH_PATTERN = /\b(research topic|deep research|research advisor|run.*advisor|full research|comprehensive research)\b/i;
+// Explicit prefix only. Accepts:
+//   /research <topic>
+//   research: <topic>
+// Anything else falls through to Claude.
+const RESEARCH_PREFIX = /^\s*(?:\/research|research:)\s+(.+)$/i;
 const RESEARCH_WRAPPER = process.env.RESEARCH_WRAPPER_PATH || '';
 
 /**
@@ -57,18 +61,14 @@ const RESEARCH_WRAPPER = process.env.RESEARCH_WRAPPER_PATH || '';
  * Returns { handled: true } to short-circuit — Claude never sees it.
  */
 async function handleResearchRequest(mc: MessageContext): Promise<{ handled: true } | undefined> {
-  if (!RESEARCH_PATTERN.test(mc.message) || !RESEARCH_WRAPPER) return undefined;
+  const userMsg = mc.userMessage ?? mc.message;
+  if (!RESEARCH_WRAPPER) return undefined;
 
-  // Extract topic from message (look for known patterns)
-  const topicMatch = mc.message.match(/(?:on|for|about|topic)\s+["']?([a-z][\w/.-]+)/i)
-    ?? mc.message.match(/research\s+(?:advisor\s+)?(?:on\s+)?["']?([a-z][\w/.-]+)/i);
+  const prefixMatch = userMsg.match(RESEARCH_PREFIX);
+  if (!prefixMatch) return undefined;
 
-  if (!topicMatch) {
-    // Can't determine topic — let Claude handle it so it can ask
-    return undefined;
-  }
-
-  const topic = topicMatch[1].replace(/["']/g, '');
+  const topic = prefixMatch[1].trim().replace(/["']/g, '');
+  if (!topic) return undefined;
 
   try {
     // Send ack to user
@@ -76,7 +76,7 @@ async function handleResearchRequest(mc: MessageContext): Promise<{ handled: tru
 
     // Spawn wrapper completely detached
     const child = spawn('bash', [RESEARCH_WRAPPER, topic, ''], {
-      cwd: '/home/node/projects/research',
+      cwd: '/home/admin/projects/research',
       detached: true,
       stdio: ['ignore', 'ignore', 'ignore'],
     });
