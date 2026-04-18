@@ -12,20 +12,22 @@ import {
   searchMemories,
   touchMemory,
 } from './db.js';
-import { embedText } from './embeddings.js';
 import { logger } from './logger.js';
-import { ingestConversationTurn } from './memory-ingest.js';
+import { saveMastraMessages } from './mastra-memory.js';
 import { buildObsidianContext } from './obsidian.js';
 
 /**
  * Build a structured memory context string to prepend to the user's message.
  *
- * Three-layer retrieval:
- *   Layer 1: FTS5 keyword search on summary + raw_text + entities + topics (top 5)
- *   Layer 2: Recent high-importance memories (importance >= 0.5, top 5 by accessed_at)
- *   Layer 3: Relevant consolidation insights
+ * Retrieval layers:
+ *   Layer 1: Legacy FTS5/vector search on old memories (top 5) - will fade as salience decays
+ *   Layer 2: Recent high-importance legacy memories (top 5)
+ *   Layer 3: Legacy consolidation insights
+ *   Layer 4: Session handoff from previous session (Gemini-powered, kept)
  *
- * Deduplicates across layers. Returns formatted context with structure.
+ * NOTE: Mastra's Observational Memory manages its own context injection
+ * through the thread history. The legacy layers above will gradually
+ * become empty as old memories decay and no new Gemini extractions occur.
  */
 export async function buildMemoryContext(
   chatId: string,
@@ -34,18 +36,8 @@ export async function buildMemoryContext(
   const seen = new Set<number>();
   const memLines: string[] = [];
 
-  // Embed the query for vector search (async, adds ~200ms but gives semantic results)
-  let queryEmbedding: number[] | undefined;
-  if (GOOGLE_API_KEY) {
-    try {
-      queryEmbedding = await embedText(userMessage);
-    } catch {
-      // Embedding failure is non-fatal; falls back to keyword search
-    }
-  }
-
-  // Layer 1: semantic search (embedding) with FTS5/LIKE fallback
-  const searched = searchMemories(chatId, userMessage, 5, queryEmbedding);
+  // Layer 1: legacy FTS5/LIKE search (no more embedding queries - Mastra handles semantic)
+  const searched = searchMemories(chatId, userMessage, 5);
   for (const mem of searched) {
     seen.add(mem.id);
     touchMemory(mem.id);
@@ -54,7 +46,7 @@ export async function buildMemoryContext(
     memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
   }
 
-  // Layer 2: recent high-importance memories (deduplicated)
+  // Layer 2: recent high-importance legacy memories (deduplicated)
   const recent = getRecentHighImportanceMemories(chatId, 5);
   for (const mem of recent) {
     if (seen.has(mem.id)) continue;
@@ -65,11 +57,10 @@ export async function buildMemoryContext(
     memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
   }
 
-  // Layer 3: consolidation insights
+  // Layer 3: legacy consolidation insights
   const insightLines: string[] = [];
   const consolidations = searchConsolidations(chatId, userMessage, 2);
   if (consolidations.length === 0) {
-    // Fall back to most recent consolidations
     const recentInsights = getRecentConsolidations(chatId, 2);
     for (const c of recentInsights) {
       insightLines.push(`- ${c.insight}`);
@@ -80,11 +71,10 @@ export async function buildMemoryContext(
     }
   }
 
-  // Layer 4: Session handoff from previous session
+  // Layer 4: Session handoff from previous session (kept - Mastra doesn't do this)
   const handoff = getLatestHandoff(chatId);
   const handoffLines: string[] = [];
   if (handoff) {
-    // Only inject handoffs from the last 48 hours (generous window for overnight work)
     const handoffAge = Math.floor(Date.now() / 1000) - handoff.created_at;
     if (handoffAge < 172800) {
       handoffLines.push(`Summary: ${handoff.summary}`);
@@ -159,11 +149,12 @@ export async function buildMemoryContext(
 }
 
 /**
- * Process a conversation turn: log it and fire async memory extraction.
+ * Process a conversation turn: log it and save to Mastra Memory.
  * Called AFTER Claude responds, with both user message and Claude's response.
  *
- * The conversation log is written synchronously (for /respin support).
- * Memory extraction via Gemini is fire-and-forget (never blocks the response).
+ * - Conversation log is written synchronously (for /respin support)
+ * - Mastra Memory save is fire-and-forget (never blocks the response)
+ *   Mastra's Observational Memory handles extraction + consolidation automatically
  */
 export function saveConversationTurn(
   chatId: string,
@@ -180,10 +171,10 @@ export function saveConversationTurn(
     logger.error({ err }, 'Failed to log conversation turn');
   }
 
-  // Fire-and-forget: LLM-powered memory extraction via Gemini
-  // This runs async and never blocks the user's response
-  void ingestConversationTurn(chatId, userMessage, claudeResponse).catch((err) => {
-    logger.error({ err }, 'Memory ingestion fire-and-forget failed');
+  // Fire-and-forget: Save to Mastra Memory (replaces Gemini extraction)
+  // Mastra's Observational Memory handles extraction + consolidation automatically
+  void saveMastraMessages(chatId, userMessage, claudeResponse).catch((err) => {
+    logger.error({ err }, 'Mastra Memory save fire-and-forget failed');
   });
 }
 
@@ -191,10 +182,12 @@ export function saveConversationTurn(
  * Run the daily decay sweep. Call once on startup and every 24h.
  * Also prunes old conversation_log entries to prevent unbounded growth.
  *
+ * NOTE: Legacy memory decay continues to run to gradually phase out
+ * old Gemini-extracted memories. Once all legacy memories have decayed
+ * below threshold, this can be simplified.
+ *
  * MESSAGE RETENTION POLICY:
  * WhatsApp and Slack messages are auto-deleted after 3 days.
- * This is a security measure: message bodies contain personal
- * conversations that must not persist on disk indefinitely.
  */
 export function runDecaySweep(): void {
   decayMemories();

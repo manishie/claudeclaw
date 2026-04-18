@@ -9,8 +9,8 @@ import { startDashboard } from './dashboard.js';
 import { initDatabase } from './db.js';
 import { logger } from './logger.js';
 import { cleanupOldUploads } from './media.js';
-import { runConsolidation } from './memory-consolidate.js';
 import { runDecaySweep } from './memory.js';
+import { initMastraMemory } from './mastra-memory.js';
 import { initOrchestrator } from './orchestrator.js';
 import { initScheduler } from './scheduler.js';
 import { setTelegramConnected, setBotInfo } from './state.js';
@@ -128,20 +128,13 @@ async function main(): Promise<void> {
   runDecaySweep();
   setInterval(() => runDecaySweep(), 24 * 60 * 60 * 1000);
 
-  // Memory consolidation: find patterns across recent memories every 30 minutes
-  if (ALLOWED_CHAT_ID && GOOGLE_API_KEY) {
-    // Delay first consolidation 2 minutes after startup to let things settle
-    setTimeout(() => {
-      void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
-        logger.error({ err }, 'Initial consolidation failed'),
-      );
-    }, 2 * 60 * 1000);
-    setInterval(() => {
-      void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
-        logger.error({ err }, 'Periodic consolidation failed'),
-      );
-    }, 30 * 60 * 1000);
-    logger.info('Memory consolidation enabled (every 30 min)');
+  // Initialize Mastra Memory (replaces Gemini consolidation)
+  // Mastra's Observational Memory handles extraction + consolidation automatically
+  try {
+    await initMastraMemory();
+    logger.info('Mastra Memory initialized (observational memory active)');
+  } catch (err) {
+    logger.error({ err }, 'Mastra Memory init failed - falling back to legacy memory only');
   }
 
   cleanupOldUploads();

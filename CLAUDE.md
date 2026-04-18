@@ -155,7 +155,7 @@ You maintain context between messages via Claude Code session resumption. You do
 
 ### `convolife`
 When [YOUR NAME] says "convolife", check the remaining context window and report back. Steps:
-1. Get the current session ID: `sqlite3 $(git rev-parse --show-toplevel)/store/claudeclaw.db "SELECT session_id FROM sessions LIMIT 1;"`
+1. Get the current session ID: `sqlite3 $(git rev-parse --show-toplevel)/store/claudeclaw.db "SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 1;"`
 2. Query the token_usage table for context size and session stats:
 ```bash
 sqlite3 $(git rev-parse --show-toplevel)/store/claudeclaw.db "
@@ -188,7 +188,7 @@ Keep it short.
 When [YOUR NAME] says "checkpoint", save a TLDR of the current conversation to SQLite so it survives a /newchat session reset. Steps:
 1. Write a tight 3-5 bullet summary of the key things discussed/decided in this session
 2. Find the DB path: `$(git rev-parse --show-toplevel)/store/claudeclaw.db`
-3. Get the actual chat_id from: `sqlite3 $(git rev-parse --show-toplevel)/store/claudeclaw.db "SELECT chat_id FROM sessions LIMIT 1;"`
+3. Get the actual chat_id from: `sqlite3 $(git rev-parse --show-toplevel)/store/claudeclaw.db "SELECT chat_id FROM sessions ORDER BY updated_at DESC LIMIT 1;"`
 4. Insert it into the memories DB as a high-salience semantic memory:
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)

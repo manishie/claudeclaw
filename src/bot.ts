@@ -18,6 +18,7 @@ import {
   agentSystemPrompt,
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
+  BACKGROUND_PROMOTE_ALL,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
 import { extractSessionHandoff } from './memory-ingest.js';
@@ -54,6 +55,7 @@ interface BackgroundTask {
 const backgroundTasks = new Map<string, BackgroundTask>(); // chatId -> active task
 
 const lastUsage = new Map<string, UsageInfo>();
+const sessionTurnCount = new Map<string, number>(); // sessionId -> turn count
 
 // Full Telegram-allowed reaction emoji pool (75 emojis) — no back-to-back repeats
 const ACK_EMOJIS = [
@@ -98,9 +100,9 @@ function getContextReport(chatId: string, sessionId: string | undefined, usage: 
     return { pct, status: `⚠️ [ctx: compacted${preK ? ` from ${preK}k` : ''}, now ${pct}% — ${totalK}k/${limitK}k] Earlier context summarized, memory preserved.`, justCompacted: true };
   }
 
-  if (pct >= 70) {
+  if (pct >= 45) {
     return { pct, status: `🛑 [ctx: ${pct}% — ${totalK}k/${limitK}k] Handoff + auto-reset...` };
-  } else if (pct >= 50) {
+  } else if (pct >= 30) {
     return { pct, status: `⚠️ [ctx: ${pct}% — ${totalK}k/${limitK}k]` };
   }
   return { pct, status: `[ctx: ${pct}% — ${totalK}k/${limitK}k]` };
@@ -402,20 +404,30 @@ async function sendResult(
     if (contextReport.status) {
       await api.sendMessage(chatId, contextReport.status);
     }
-    if (contextReport.pct >= 70 && !contextReport.justCompacted) {
-      // Extract structured handoff via Gemini before clearing
-      const activeSessionId = result.newSessionId ?? sessionId;
+
+    // Track turns per session for turn-count based handoff trigger
+    const currentTurns = (sessionTurnCount.get(activeSessionId ?? '') ?? 0) + 1;
+    sessionTurnCount.set(activeSessionId ?? '', currentTurns);
+
+    // Auto-handoff triggers: 45% context OR 80+ turns (fires even after compaction)
+    const shouldHandoff = contextReport.pct >= 45 || currentTurns >= 80;
+    if (shouldHandoff) {
+      const handoffSessionId = result.newSessionId ?? sessionId;
+      const reason = currentTurns >= 80 && contextReport.pct < 45
+        ? `${currentTurns} turns`
+        : `context at ${contextReport.pct}%`;
       try {
-        const handoffSaved = await extractSessionHandoff(chatIdStr, activeSessionId, AGENT_ID);
+        const handoffSaved = await extractSessionHandoff(chatIdStr, handoffSessionId, AGENT_ID);
         if (handoffSaved) {
-          logger.info({ chatId: chatIdStr }, 'Handoff extracted before auto-reset');
+          logger.info({ chatId: chatIdStr, reason }, 'Handoff extracted before auto-reset');
         }
       } catch (handoffErr) {
         logger.error({ err: handoffErr }, 'Handoff extraction failed (non-blocking)');
       }
 
+      sessionTurnCount.delete(activeSessionId ?? '');
       clearSession(chatIdStr, AGENT_ID);
-      await api.sendMessage(chatId, 'Session auto-reset (context at ' + contextReport.pct + '%). Memory preserved.');
+      await api.sendMessage(chatId, `Session auto-reset (${reason}). Memory preserved.`);
     }
   }
 }
@@ -590,8 +602,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     let promoteResolve: (() => void) | null = null;
     const promotePromise = new Promise<void>((resolve) => { promoteResolve = resolve; });
 
-    const backgroundPromoteAll = process.env.BACKGROUND_PROMOTE_ALL === 'true';
-    const ackTimeout = !backgroundPromoteAll ? null : setTimeout(async () => {
+    const ackTimeout = !BACKGROUND_PROMOTE_ALL ? null : setTimeout(async () => {
       promoted = true;
       backgroundTasks.set(chatIdStr, { startedAt: Date.now(), message: message.slice(0, 80), phases: [], activity: 'Starting...' });
       // Replay any progress events that arrived before promotion
@@ -621,16 +632,27 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       } catch { /* ignore ack errors */ }
       // Release the message queue handler so new messages can process
       promoteResolve?.();
-    }, 15_000);
+    }, 45_000);
 
-    // Auto-abort if the agent runs too long
-    const timeoutId = setTimeout(() => {
-      logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query timed out, aborting');
-      abortCtrl.abort();
+    // Auto-abort if the agent runs too long.
+    // Instead of hard-aborting (which kills the process but leaves underlying tasks running),
+    // send a "still working" notice and let the process continue up to 3x the timeout.
+    let softTimedOut = false;
+    const softTimeoutId = setTimeout(async () => {
+      softTimedOut = true;
+      logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query soft timeout — sending notice');
+      try {
+        await ctx.api.sendMessage(chatId, 'This is taking longer than usual. Still working on it...');
+      } catch { /* ignore */ }
     }, AGENT_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => {
+      logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS * 3 }, 'Agent query hard timeout, aborting');
+      abortCtrl.abort();
+    }, AGENT_TIMEOUT_MS * 3);
 
     // Deliver results when the query finishes (foreground or background)
     const deliverResult = async (result: Awaited<ReturnType<typeof runAgent>>) => {
+      clearTimeout(softTimeoutId);
       clearTimeout(timeoutId);
       if (ackTimeout) clearTimeout(ackTimeout);
       setActiveAbort(chatIdStr, null);
@@ -671,7 +693,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
         if (!recovered) {
           setProcessing(chatIdStr, false);
           const msg = result.text === null
-            ? `Background task timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. No results found.`
+            ? `Task stopped after ${Math.round((AGENT_TIMEOUT_MS * 3) / 1000)}s. Any background processes may still be running — check results on your next message.`
             : 'Stopped.';
           emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
           await ctx.api.sendMessage(chatId, msg);
@@ -700,7 +722,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // If promoted to background: release the queue now, deliver result later
     // If not promoted: wait for result inline (normal fast path)
     // Race with promotion promise when background promotion is enabled
-    const result = backgroundPromoteAll
+    const result = BACKGROUND_PROMOTE_ALL
       ? await Promise.race([agentPromise, promotePromise.then(() => null as null)])
       : await agentPromise;
 
@@ -925,17 +947,27 @@ export function createBot(plugins?: ClawAPI): Bot {
     return ctx.reply('ClaudeClaw online. What do you need?');
   });
 
-  // /newchat — clear Claude session, start fresh + auto-commit to hive mind
+  // /newchat — extract Gemini handoff, commit to hive mind, then clear session
   bot.command('newchat', async (ctx) => {
     if (!isAuthorised(ctx.chat!.id)) return;
     const chatIdStr = ctx.chat!.id.toString();
     const oldSessionId = getSession(chatIdStr, AGENT_ID);
 
-    // Auto-commit session summary to hive mind (async, don't block the user)
     if (oldSessionId) {
       const sessionToSummarize = oldSessionId;
+      await ctx.reply('Extracting handoff before clearing...');
 
-      // Fire-and-forget: ask the agent to produce a one-liner summary
+      // 1. Extract full Gemini handoff (blocking — must complete before clear)
+      try {
+        const handoffSaved = await extractSessionHandoff(chatIdStr, sessionToSummarize, AGENT_ID);
+        if (handoffSaved) {
+          logger.info({ chatId: chatIdStr }, 'Handoff extracted before /newchat clear');
+        }
+      } catch (handoffErr) {
+        logger.error({ err: handoffErr }, 'Handoff extraction failed during /newchat (non-blocking)');
+      }
+
+      // 2. Also commit one-liner to hive mind (fire-and-forget)
       (async () => {
         try {
           const turns = getSessionConversation(sessionToSummarize, 40);
@@ -956,7 +988,6 @@ export function createBot(plugins?: ClawAPI): Bot {
             logger.info({ agentId: AGENT_ID, summary }, 'Hive mind auto-commit (LLM summary)');
           }
         } catch (err) {
-          // Fallback: log a basic summary from conversation turns
           try {
             const turns = getSessionConversation(sessionToSummarize, 40);
             if (turns.length >= 2) {
@@ -967,10 +998,12 @@ export function createBot(plugins?: ClawAPI): Bot {
           logger.error({ err }, 'Hive mind LLM summary failed, used fallback');
         }
       })();
+
+      sessionTurnCount.delete(sessionToSummarize);
     }
 
     clearSession(chatIdStr, AGENT_ID);
-    await ctx.reply('Session cleared. Starting fresh.');
+    await ctx.reply('Session cleared. Handoff saved. Starting fresh.');
     logger.info({ chatId: ctx.chat!.id }, 'Session cleared by user');
   });
 

@@ -114,6 +114,10 @@ export const AGENT_TIMEOUT_MS = parseInt(
   10,
 );
 
+// Whether to auto-promote long-running tasks to background after 15s.
+export const BACKGROUND_PROMOTE_ALL =
+  (process.env.BACKGROUND_PROMOTE_ALL || envConfig.BACKGROUND_PROMOTE_ALL || '').toLowerCase() === 'true';
+
 // Context window limit. Can be overridden via CONTEXT_LIMIT in .env.
 // If not set, contextLimitForModel() derives it from the model name.
 export const CONTEXT_LIMIT_OVERRIDE = process.env.CONTEXT_LIMIT || envConfig.CONTEXT_LIMIT || '';
